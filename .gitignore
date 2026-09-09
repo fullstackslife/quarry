@@ -1,0 +1,17 @@
+node_modules
+.vercel
+.output
+.nitro
+.tanstack
+dist
+*.log
+.DS_Store
+.env
+.env.local
+.env*.local
+screenshots
+artifacts
+.grok/og-pending
+.project_id
+.vscode
+.idea
