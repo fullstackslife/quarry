@@ -1915,15 +1915,6 @@ function HistorySheet({
   onOpen: (record: ReviewRecord) => void;
   onImport: (records: ReviewRecord[]) => void;
 }) {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  records: ReviewRecord[];
-  watchlist: string[];
-  playbooks: Record<string, Playbook>;
-  defaultPlaybook: Playbook;
-  onOpen: (record: ReviewRecord) => void;
-  onImport: (records: ReviewRecord[]) => void;
-}) {
   function download(name: string, body: string, type: string) {
     const blob = new Blob([body], { type });
     const url = URL.createObjectURL(blob);

@@ -71,4 +71,5 @@ GitHub tokens and `LM_API_TOKEN` stay on this machine. The dump has reviews, wat
 ```bash
 railway run --service Postgres -- npm run db:migrate
 railway run --service Postgres -- npm run db:push -- quarry-dump.json
+railway run --service Postgres -- npm run db:pull -- quarry-dump.json
 ```
