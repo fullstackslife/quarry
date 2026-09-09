@@ -58,6 +58,9 @@ export async function readOpenAIStream(
 }
 
 export function formatModelHttpError(status: number, body: string): string {
+  if (status === 401 || status === 403) {
+    return "LM Studio rejected the API token. Check LM_API_TOKEN in .env.";
+  }
   if (status === 404) return "That model is not loaded. Pick another in Settings.";
   if (status === 413) return "The repo dump is too large for this model. Lower the file budget.";
   if (status === 429) return "The model is busy. Wait a moment and try again.";

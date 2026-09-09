@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -11,6 +11,7 @@ import {
   parseAppEnv,
   projectRoot,
   readAppEnv,
+  resolveWrappedCommand,
 } from "./with-app-env.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -111,6 +112,16 @@ test("a signal-killed command is never reported as success", async () => {
     ]),
     (err) => err.signal === "SIGTERM" || err.code !== 0,
   );
+});
+
+test("vite is resolved to the local JS binary", () => {
+  const viteJs = join(projectRoot(), "node_modules", "vite", "bin", "vite.js");
+  if (!existsSync(viteJs)) return;
+  const resolved = resolveWrappedCommand("vite", ["dev", "--host", "0.0.0.0"]);
+  assert.equal(resolved.command, process.execPath);
+  assert.equal(resolved.args[0], viteJs);
+  assert.deepEqual(resolved.args.slice(1), ["dev", "--host", "0.0.0.0"]);
+  assert.equal(resolved.shell, false);
 });
 
 test("the CLI still runs when invoked through a symlinked path", async () => {

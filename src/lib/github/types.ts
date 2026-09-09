@@ -17,6 +17,7 @@ export type RepoMeta = {
   avatarUrl: string | null;
   htmlUrl: string;
   topics: string[];
+  private: boolean;
 };
 
 export type FileEntry = {

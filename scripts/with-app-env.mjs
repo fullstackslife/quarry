@@ -20,7 +20,7 @@
  * `process.env`, which is why the merge has to happen before Vite starts.
  */
 import { spawn } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -104,6 +104,36 @@ export function isMainModule(moduleUrl) {
   }
 }
 
+/**
+ * npm scripts can spawn `vite` by name. This wrapper is `node …mjs vite …`,
+ * so Windows cannot see `vite.cmd` unless we resolve the local binary.
+ * Prefer Vite's JS entry so we never need `shell: true`.
+ */
+export function resolveWrappedCommand(command, args, root = projectRoot()) {
+  if (command.includes("/") || command.includes("\\") || command.endsWith(".js") || command.endsWith(".mjs")) {
+    return { command, args, shell: false };
+  }
+  if (command === "vite") {
+    const viteJs = join(root, "node_modules", "vite", "bin", "vite.js");
+    if (existsSync(viteJs)) {
+      return { command: process.execPath, args: [viteJs, ...args], shell: false };
+    }
+  }
+  const binDir = join(root, "node_modules", ".bin");
+  if (process.platform === "win32") {
+    const cmdPath = join(binDir, `${command}.cmd`);
+    if (existsSync(cmdPath)) {
+      return { command: cmdPath, args, shell: true };
+    }
+  } else {
+    const unixPath = join(binDir, command);
+    if (existsSync(unixPath)) {
+      return { command: unixPath, args, shell: false };
+    }
+  }
+  return { command, args, shell: process.platform === "win32" };
+}
+
 function main(argv) {
   const [command, ...args] = argv;
   if (!command) {
@@ -111,7 +141,12 @@ function main(argv) {
     process.exit(2);
   }
   const env = mergeAppEnv(readAppEnv(projectRoot()), process.env);
-  const child = spawn(command, args, { stdio: "inherit", env });
+  const resolved = resolveWrappedCommand(command, args);
+  const child = spawn(resolved.command, resolved.args, {
+    stdio: "inherit",
+    env,
+    shell: resolved.shell,
+  });
   // The dev server is long-running and is stopped by signalling this wrapper.
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     process.on(signal, () => child.kill(signal));

@@ -62,19 +62,53 @@ export function Report({
   result,
   streamText,
   reviewing,
+  queueProgress,
 }: {
   owner: string;
   repo: string;
   result: ReviewResult | null;
   streamText: string;
   reviewing: boolean;
+  queueProgress?: {
+    phase: "files" | "merge";
+    batch: number;
+    total: number;
+    paths: string[];
+  } | null;
 }) {
   if (reviewing) {
+    const label =
+      queueProgress?.phase === "merge"
+        ? `Merging ${queueProgress.total} batch reviews`
+        : queueProgress && queueProgress.total > 1
+          ? `Queue ${queueProgress.batch} of ${queueProgress.total}`
+          : "Reading the cut";
     return (
       <div className="rounded-2xl bg-card p-5 shadow-[var(--shadow-border)] md:p-6">
         <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          Reading the cut
+          {label}
         </p>
+        {queueProgress?.paths.length ? (
+          <p className="mt-2 font-mono text-xs leading-relaxed text-muted-foreground">
+            {queueProgress.paths.join(" · ")}
+          </p>
+        ) : null}
+        {queueProgress && queueProgress.total > 1 ? (
+          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-muted">
+            <div
+              className="h-full bg-primary transition-[width] duration-300"
+              style={{
+                width: `${Math.round(
+                  ((queueProgress.phase === "merge"
+                    ? queueProgress.total
+                    : queueProgress.batch - 1) /
+                    queueProgress.total) *
+                    100,
+                )}%`,
+              }}
+            />
+          </div>
+        ) : null}
         <pre className="mt-4 max-h-[50vh] overflow-auto scroll-thin font-mono text-xs leading-relaxed text-foreground/90 whitespace-pre-wrap">
           {streamText || "Waiting for the first tokens…"}
           <span className="ml-0.5 inline-block h-3 w-1.5 translate-y-0.5 bg-primary motion-safe:animate-pulse" />

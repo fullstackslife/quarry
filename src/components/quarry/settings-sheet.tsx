@@ -75,7 +75,8 @@ export function SettingsSheet({
           <div>
             <DialogTitle>Settings</DialogTitle>
             <DialogDescription className="mt-1 max-w-sm">
-              Quarry talks to LM Studio from your browser. Grok is the hosted fallback.
+              Quarry calls LM Studio through this app with LM_API_TOKEN. Grok is
+              the hosted fallback.
             </DialogDescription>
           </div>
           <DialogClose />
@@ -129,7 +130,7 @@ export function SettingsSheet({
               onChange={(e) =>
                 onChange({ ...settings, lmStudioUrl: e.target.value })
               }
-              placeholder="http://127.0.0.1:1234/v1"
+              placeholder="http://100.66.236.13:1234/v1"
               autoCapitalize="off"
               autoCorrect="off"
               spellCheck={false}
@@ -177,12 +178,15 @@ export function SettingsSheet({
               <p className="text-sm text-muted-foreground">{lmStatus.reason}</p>
             ) : null}
             <ol className="list-decimal space-y-1.5 pl-4 text-sm text-muted-foreground">
-              <li>Load a model in LM Studio.</li>
-              <li>Start the local server.</li>
-              <li>Enable CORS in Developer settings.</li>
+              <li>Start the server in LM Studio (Developer page).</li>
+              <li>Load a model (Ctrl+L). Reviews fail until one is loaded.</li>
               <li>
-                On a phone, bind the server to all interfaces and paste your
-                computer's network address above.
+                Put <code>LM_API_TOKEN</code> and optionally{" "}
+                <code>LM_STUDIO_URL</code> in <code>.env</code>.
+              </li>
+              <li>
+                Tailscale and LAN addresses work. Paste the Developer page URL
+                above if it is not already set.
               </li>
             </ol>
           </section>
@@ -198,12 +202,13 @@ export function SettingsSheet({
               onChange={(e) =>
                 onChange({ ...settings, githubToken: e.target.value })
               }
-              placeholder="Optional. Public-repo read is enough."
+              placeholder="ghp_…  Contents: Read for private repos"
               autoComplete="off"
             />
             <p className="text-sm text-muted-foreground">
-              Unauthenticated GitHub access is tightly rate-limited. A token
-              stays on this device.
+              Needed for private repos and for a higher public rate limit. Fine-grained:
+              Contents read on the repos you review. Classic: the repo scope. Stays on
+              this device.
             </p>
           </section>
 
@@ -211,7 +216,7 @@ export function SettingsSheet({
 
           <section className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
-              <Label htmlFor="max-files">Max files</Label>
+              <Label htmlFor="max-files">Smart-set files</Label>
               <Input
                 id="max-files"
                 type="number"

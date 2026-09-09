@@ -12,7 +12,7 @@ export type Settings = {
 
 export const DEFAULT_SETTINGS: Settings = {
   provider: "auto",
-  lmStudioUrl: "http://127.0.0.1:1234/v1",
+  lmStudioUrl: "http://100.66.236.13:1234/v1",
   lmStudioModel: "",
   githubToken: "",
   temperature: 0.2,

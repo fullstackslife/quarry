@@ -42,7 +42,14 @@ import { getGrokAvailability } from "@/lib/llm/availability";
 import { completeChat } from "@/lib/llm/complete";
 import { probeLmStudio, type LmStatus } from "@/lib/llm/lmstudio";
 import { parseReview } from "@/lib/review/parse";
-import { buildReviewMessages } from "@/lib/review/prompt";
+import { buildReviewMessages, buildSynthesisMessages } from "@/lib/review/prompt";
+import {
+  BATCH_MAX_CHARS,
+  compactBatchForMerge,
+  mergeReviewResults,
+  queueReviewBatches,
+  type ReviewQueueProgress,
+} from "@/lib/review/queue";
 import {
   LENSES,
   type ReviewLens,
@@ -55,7 +62,7 @@ import {
   saveSettings,
   type Settings,
 } from "@/lib/settings";
-import { APP_NAME } from "@/lib/brand";
+import { APP_NAME, APP_TAGLINE } from "@/lib/brand";
 import { cn } from "@/lib/utils";
 
 const SUGGESTED = [
@@ -99,6 +106,9 @@ export function QuarryApp() {
   const [contents, setContents] = useState<Record<string, string>>({});
   const [tab, setTab] = useState("overview");
   const [streamText, setStreamText] = useState("");
+  const [queueProgress, setQueueProgress] = useState<ReviewQueueProgress | null>(
+    null,
+  );
   const [result, setResult] = useState<ReviewResult | null>(null);
   const [providerLabel, setProviderLabel] = useState("");
   const abortRef = useRef<AbortController | null>(null);
@@ -108,6 +118,14 @@ export function QuarryApp() {
     setSettings(next);
     setHistory(loadHistory());
     void getGrokAvailability().then((value) => setGrokAvailable(value.grok));
+    void probeLmStudio(next.lmStudioUrl).then((status) => {
+      setLmStatus(status);
+      if (status.state === "online" && !next.lmStudioModel && status.models[0]) {
+        const seeded = { ...next, lmStudioModel: status.models[0] };
+        setSettings(seeded);
+        saveSettings(seeded);
+      }
+    });
   }, []);
 
   function updateSettings(next: Settings) {
@@ -182,10 +200,21 @@ export function QuarryApp() {
     );
   }
 
-  async function ensureContents(paths: string[]) {
-    if (!bundle) return contents;
-    const missing = paths.filter((path) => !contents[path]);
-    if (missing.length === 0) return contents;
+  function toggleAllListed() {
+    if (!bundle) return;
+    const listed = bundle.files.map((file) => file.path);
+    const allOn =
+      listed.length > 0 && listed.every((path) => selected.includes(path));
+    setSelected(allOn ? [] : listed);
+  }
+
+  async function ensureContents(
+    paths: string[],
+    base: Record<string, string> = contents,
+  ) {
+    if (!bundle) return base;
+    const missing = paths.filter((path) => !base[path]);
+    if (missing.length === 0) return base;
     const res = await fetchFileContents({
       owner: bundle.meta.owner,
       repo: bundle.meta.repo,
@@ -195,7 +224,7 @@ export function QuarryApp() {
     if (!res.ok) {
       throw new Error(res.error);
     }
-    const merged = { ...contents, ...res.data };
+    const merged = { ...base, ...res.data };
     setContents(merged);
     return merged;
   }
@@ -227,7 +256,8 @@ export function QuarryApp() {
       }
     }
 
-    const paths = selected.slice(0, settings.maxFiles);
+    const paths =
+      target === "grok" ? selected.slice(0, settings.maxFiles) : selected;
     if (paths.length === 0) {
       setError("Select at least one file to review.");
       setTab("files");
@@ -241,6 +271,7 @@ export function QuarryApp() {
     setError(null);
     setResult(null);
     setStreamText("");
+    setQueueProgress(null);
     setPhase("reviewing");
     setTab("review");
 
@@ -248,7 +279,6 @@ export function QuarryApp() {
     abortRef.current = controller;
 
     try {
-      const loaded = await ensureContents(paths);
       const model =
         target === "lmstudio"
           ? settings.lmStudioModel || lmModels[0] || ""
@@ -257,36 +287,102 @@ export function QuarryApp() {
         throw new Error("Pick a loaded LM Studio model in Settings.");
       }
 
-      const budget =
-        target === "grok"
-          ? Math.min(Math.max(settings.maxChars, 48_000), 140_000)
-          : settings.maxChars;
-
-      const messages = buildReviewMessages({
-        meta: bundle.meta,
-        languages: bundle.languages,
-        allPaths: bundle.files.map((file) => file.path),
-        contents: loaded,
-        selected: paths,
-        lens,
-        maxChars: budget,
-      });
-
       const label =
         target === "lmstudio" ? `LM Studio · ${model}` : "Grok 4.5";
       setProviderLabel(label);
 
-      const text = await completeChat({
-        target,
-        lmStudioUrl: settings.lmStudioUrl,
-        model,
-        messages,
-        temperature: settings.temperature,
-        signal: controller.signal,
-        onDelta: (chunk) => setStreamText((prev) => prev + chunk),
-      });
+      const sizes = Object.fromEntries(
+        bundle.files.map((file) => [file.path, file.size]),
+      );
+      const batches =
+        target === "lmstudio"
+          ? queueReviewBatches(paths, contents, sizes)
+          : [paths];
 
-      const parsed = parseReview(text);
+      let loaded = contents;
+      const batchResults: ReviewResult[] = [];
+
+      for (let i = 0; i < batches.length; i += 1) {
+        const batchPaths = batches[i] ?? [];
+        setQueueProgress({
+          phase: "files",
+          batch: i + 1,
+          total: batches.length,
+          paths: batchPaths,
+        });
+        setStreamText("");
+        loaded = await ensureContents(batchPaths, loaded);
+
+        const budget =
+          target === "grok"
+            ? Math.min(Math.max(settings.maxChars, 48_000), 140_000)
+            : BATCH_MAX_CHARS;
+
+        const messages = buildReviewMessages({
+          meta: bundle.meta,
+          languages: bundle.languages,
+          allPaths: bundle.files.map((file) => file.path),
+          contents: loaded,
+          selected: batchPaths,
+          lens,
+          maxChars: budget,
+          treeLimit: batches.length > 1 ? 60 : 80,
+          findingHint: batches.length > 1 ? "Write 3 to 8 findings." : undefined,
+          batch:
+            batches.length > 1
+              ? { index: i + 1, total: batches.length }
+              : undefined,
+        });
+
+        const text = await completeChat({
+          target,
+          lmStudioUrl: settings.lmStudioUrl,
+          model,
+          messages,
+          temperature: settings.temperature,
+          signal: controller.signal,
+          onDelta: (chunk) => setStreamText((prev) => prev + chunk),
+        });
+        batchResults.push(parseReview(text));
+      }
+
+      let parsed = mergeReviewResults(batchResults);
+      if (target === "lmstudio" && batches.length > 1) {
+        setQueueProgress({
+          phase: "merge",
+          batch: batches.length,
+          total: batches.length,
+          paths: [],
+        });
+        setStreamText("");
+        const notes = batchResults.map((part, i) =>
+          compactBatchForMerge(part, batches[i] ?? []),
+        );
+        try {
+          const mergeText = await completeChat({
+            target,
+            lmStudioUrl: settings.lmStudioUrl,
+            model,
+            messages: buildSynthesisMessages({
+              meta: bundle.meta,
+              lens,
+              fileCount: paths.length,
+              batchCount: batches.length,
+              notes,
+            }),
+            temperature: Math.min(settings.temperature, 0.3),
+            signal: controller.signal,
+            onDelta: (chunk) => setStreamText((prev) => prev + chunk),
+          });
+          const merged = parseReview(mergeText);
+          if (merged.kind === "structured") parsed = merged;
+        } catch (err) {
+          if (controller.signal.aborted) throw err;
+          // Keep the heuristic merge if the synthesis pass fails.
+        }
+      }
+
+      setQueueProgress(null);
       setResult(parsed);
       setPhase("ready");
       const record: ReviewRecord = {
@@ -304,17 +400,20 @@ export function QuarryApp() {
       setHistory((current) => pushHistory(record, current));
     } catch (err) {
       if (controller.signal.aborted) {
+        setQueueProgress(null);
         setPhase("ready");
         return;
       }
       const message = err instanceof Error ? err.message : "Review failed.";
       setError(message);
+      setQueueProgress(null);
       setPhase("ready");
     }
   }
 
   function cancelReview() {
     abortRef.current?.abort();
+    setQueueProgress(null);
     setPhase("ready");
   }
 
@@ -325,6 +424,7 @@ export function QuarryApp() {
     setContents({});
     setResult(null);
     setStreamText("");
+    setQueueProgress(null);
     setError(null);
     setPhase("idle");
     setTab("overview");
@@ -416,12 +516,14 @@ export function QuarryApp() {
               contents={contents}
               onToggle={togglePath}
               onSmart={applySmart}
+              onSelectAll={toggleAllListed}
               onLoad={() => void loadRepo(source)}
               onReview={() => void runReview()}
               onCancel={cancelReview}
               onReset={reset}
               result={result}
               streamText={streamText}
+              queueProgress={queueProgress}
               providerLabel={providerLabel}
               resolvedTarget={resolvedTarget}
             />
@@ -485,14 +587,15 @@ function Landing({
   return (
     <section className="mx-auto flex w-full max-w-2xl flex-1 flex-col justify-center pb-10">
       <p className="text-xs font-medium tracking-[0.18em] text-muted-foreground uppercase">
-        Public repos. Local models.
+        {APP_TAGLINE}
       </p>
       <h1 className="mt-4 font-display text-4xl leading-none tracking-tight md:text-6xl">
         See the work as it actually is.
       </h1>
       <p className="mt-5 max-w-xl text-base leading-relaxed text-muted-foreground md:text-lg">
-        Paste a public GitHub URL. Quarry reads the source and writes a structured
-        review — using your LM Studio model, or Grok if no local server is running.
+        Paste a GitHub URL you can access. Quarry reads the source and writes a
+        structured review — using your LM Studio model, or Grok if no local
+        server is running. Private repos need a token in Settings.
       </p>
 
       <form
@@ -521,7 +624,7 @@ function Landing({
       {error ? (
         <p className="mt-3 text-sm text-danger">
           {error}{" "}
-          {/token|rate/i.test(error) ? (
+          {/token|rate|private/i.test(error) ? (
             <button
               type="button"
               className="underline underline-offset-2"
@@ -585,12 +688,14 @@ function Workspace({
   contents,
   onToggle,
   onSmart,
+  onSelectAll,
   onLoad,
   onReview,
   onCancel,
   onReset,
   result,
   streamText,
+  queueProgress,
   providerLabel,
   resolvedTarget,
 }: {
@@ -609,12 +714,14 @@ function Workspace({
   contents: Record<string, string>;
   onToggle: (path: string) => void;
   onSmart: () => void;
+  onSelectAll: () => void;
   onLoad: () => void;
   onReview: () => void;
   onCancel: () => void;
   onReset: () => void;
   result: ReviewResult | null;
   streamText: string;
+  queueProgress: ReviewQueueProgress | null;
   providerLabel: string;
   resolvedTarget: "lmstudio" | "grok" | null;
 }) {
@@ -665,6 +772,9 @@ function Workspace({
               <h1 className="font-display text-2xl tracking-tight md:text-3xl">
                 {meta.owner}/{meta.repo}
               </h1>
+              {meta.private ? (
+                <Badge variant="warn">Private</Badge>
+              ) : null}
               <a
                 href={meta.htmlUrl}
                 target="_blank"
@@ -752,7 +862,9 @@ function Workspace({
             </Button>
           ) : (
             <Button type="button" onClick={onReview} disabled={loading}>
-              Review {selected.length} files
+              {resolvedTarget === "lmstudio" && selected.length > 6
+                ? `Review ${selected.length} files in queue`
+                : `Review ${selected.length} files`}
             </Button>
           )}
         </div>
@@ -782,6 +894,7 @@ function Workspace({
               contents={contents}
               onToggle={onToggle}
               onSmart={onSmart}
+              onSelectAll={onSelectAll}
               listedTruncated={bundle.listedTruncated}
             />
           </div>
@@ -789,9 +902,9 @@ function Workspace({
             <div className="rounded-2xl bg-card p-5 shadow-[var(--shadow-border)]">
               <h2 className="font-display text-xl tracking-tight">What will be read</h2>
               <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
-                Quarry sends the selected files, a tree excerpt, and repo metadata
-                to the model. Nothing is stored on a server — history lives in this
-                browser.
+                Quarry queues selected files into small LM Studio jobs so the
+                local model is not overloaded, then merges the findings. History
+                stays in this browser.
               </p>
               <ul className="mt-4 space-y-1.5 font-mono text-xs text-muted-foreground">
                 {selected.slice(0, 12).map((path) => (
@@ -818,6 +931,7 @@ function Workspace({
             contents={contents}
             onToggle={onToggle}
             onSmart={onSmart}
+            onSelectAll={onSelectAll}
             listedTruncated={bundle.listedTruncated}
           />
         </TabsContent>
@@ -828,6 +942,7 @@ function Workspace({
             result={result}
             streamText={streamText}
             reviewing={reviewing}
+            queueProgress={queueProgress}
           />
         </TabsContent>
       </Tabs>

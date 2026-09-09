@@ -45,10 +45,17 @@ function fail(
   return { ok: false, error, code };
 }
 
-function mapStatus(status: number, remaining: string | null, message?: string) {
+function mapStatus(
+  status: number,
+  remaining: string | null,
+  message?: string,
+  token?: string,
+) {
   if (status === 404) {
     return fail(
-      "Repository not found, or it is private. Quarry only reads public repos.",
+      token
+        ? "Repository not found, or this token cannot access it."
+        : "Repository not found. Private repos need a GitHub token in Settings.",
       "not_found",
     );
   }
@@ -70,6 +77,19 @@ function mapStatus(status: number, remaining: string | null, message?: string) {
   return fail(message || `GitHub error ${status}`, "network");
 }
 
+function isGithubDownloadHost(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return (
+      host === "github.com" ||
+      host.endsWith(".github.com") ||
+      host === "raw.githubusercontent.com" ||
+      host.endsWith(".githubusercontent.com")
+    );
+  } catch {
+    return false;
+  }
+}
 function decodeBase64(content: string): string {
   const cleaned = content.replace(/\n/g, "");
   const binary = atob(cleaned);
@@ -137,8 +157,8 @@ async function loadContents(
   paths: string[],
   token: string | undefined,
 ): Promise<Record<string, string>> {
-  const unique = [...new Set(paths)].slice(0, 24);
-  const pairs = await mapPool(unique, 6, async (path) => {
+    const unique = [...new Set(paths)].slice(0, 2000);
+    const pairs = await mapPool(unique, 10, async (path) => {
     const encoded = path
       .split("/")
       .map((part) => encodeURIComponent(part))
@@ -152,7 +172,12 @@ async function loadContents(
     if (json.encoding === "base64" && json.content) {
       text = decodeBase64(json.content);
     } else if (json.download_url) {
-      const raw = await fetch(json.download_url);
+      const headers: Record<string, string> = {};
+      if (token && isGithubDownloadHost(json.download_url)) {
+        headers.Authorization = `Bearer ${token}`;
+        headers.Accept = "application/vnd.github.raw";
+      }
+      const raw = await fetch(json.download_url, { headers });
       if (raw.ok) text = await raw.text();
     }
     if (text.length > 80_000) {
@@ -191,10 +216,18 @@ export async function openRepo(input: {
       token,
     );
     if (repoRes.status >= 400) {
-      return mapStatus(repoRes.status, repoRes.remaining, repoRes.json.message);
+      return mapStatus(
+        repoRes.status,
+        repoRes.remaining,
+        repoRes.json.message,
+        token,
+      );
     }
-    if (repoRes.json.private) {
-      return fail("That repository is private.", "not_found");
+    if (repoRes.json.private && !token) {
+      return fail(
+        "This repository is private. Add a GitHub token in Settings with access to it.",
+        "unauthorized",
+      );
     }
 
     const repo = repoRes.json;
@@ -212,6 +245,7 @@ export async function openRepo(input: {
       avatarUrl: repo.owner.avatar_url,
       htmlUrl: repo.html_url,
       topics: repo.topics ?? [],
+      private: Boolean(repo.private),
     };
 
     const [langRes, treeRes] = await Promise.all([
@@ -226,7 +260,12 @@ export async function openRepo(input: {
     ]);
 
     if (treeRes.status >= 400) {
-      return mapStatus(treeRes.status, treeRes.remaining, treeRes.json.message);
+      return mapStatus(
+        treeRes.status,
+        treeRes.remaining,
+        treeRes.json.message,
+        token,
+      );
     }
 
     const languages = langRes.status < 400 ? langRes.json : {};
@@ -238,7 +277,7 @@ export async function openRepo(input: {
         sha: node.sha,
       }));
 
-    const listed = listReviewableFiles(blobs, 400);
+    const listed = listReviewableFiles(blobs, 2000);
     const selected = pickSmartFiles(blobs, lens, maxFiles, maxChars);
     const contents = await loadContents(meta.owner, meta.repo, selected, token);
 

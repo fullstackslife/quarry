@@ -10,11 +10,17 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as ApiLmRouteImport } from './routes/api/lm'
 import { Route as ApiReviewRouteImport } from './routes/api/review'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiLmRoute = ApiLmRouteImport.update({
+  id: '/api/lm',
+  path: '/api/lm',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ApiReviewRoute = ApiReviewRouteImport.update({
@@ -25,27 +31,31 @@ const ApiReviewRoute = ApiReviewRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/api/lm': typeof ApiLmRoute
   '/api/review': typeof ApiReviewRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/api/lm': typeof ApiLmRoute
   '/api/review': typeof ApiReviewRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/api/lm': typeof ApiLmRoute
   '/api/review': typeof ApiReviewRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/api/review'
+  fullPaths: '/' | '/api/lm' | '/api/review'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/api/review'
-  id: '__root__' | '/' | '/api/review'
+  to: '/' | '/api/lm' | '/api/review'
+  id: '__root__' | '/' | '/api/lm' | '/api/review'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  ApiLmRoute: typeof ApiLmRoute
   ApiReviewRoute: typeof ApiReviewRoute
 }
 
@@ -56,6 +66,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/lm': {
+      id: '/api/lm'
+      path: '/api/lm'
+      fullPath: '/api/lm'
+      preLoaderRoute: typeof ApiLmRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/review': {
@@ -70,6 +87,7 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  ApiLmRoute: ApiLmRoute,
   ApiReviewRoute: ApiReviewRoute,
 }
 export const routeTree = rootRouteImport
