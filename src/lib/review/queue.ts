@@ -3,6 +3,7 @@ import type { Finding, FindingSeverity, ReviewResult, StructuredReview } from ".
 export const BATCH_MAX_FILES = 6;
 export const BATCH_MAX_CHARS = 16_000;
 export const FILE_MAX_CHARS = 6_000;
+export const LM_STUDIO_CONCURRENCY = 2;
 
 const SEVERITY_RANK: Record<FindingSeverity, number> = {
   critical: 4,
@@ -147,6 +148,45 @@ export function mergeReviewResults(parts: ReviewResult[]): ReviewResult {
     };
   }
   return mergeStructuredReviews(structured);
+}
+
+export async function runConcurrentIndexes(input: {
+  indexes: number[];
+  concurrency: number;
+  signal: AbortSignal;
+  worker: (index: number) => Promise<void>;
+}): Promise<void> {
+  let cursor = 0;
+  async function run() {
+    while (!input.signal.aborted) {
+      const position = cursor;
+      cursor += 1;
+      const index = input.indexes[position];
+      if (index === undefined) return;
+      await input.worker(index);
+    }
+  }
+  const n = Math.max(1, Math.min(input.concurrency, input.indexes.length || 1));
+  await Promise.all(Array.from({ length: input.indexes.length ? n : 0 }, () => run()));
+}
+
+export function markPartialReview(
+  result: ReviewResult,
+  done: number,
+  total: number,
+): ReviewResult {
+  if (done >= total) return result;
+  if (result.kind === "structured") {
+    return {
+      ...result,
+      headline: `Partial ${done}/${total} — ${result.headline}`,
+      summary: `Saved ${done} of ${total} file batches locally. Resume the queue to finish.\n\n${result.summary}`,
+    };
+  }
+  return {
+    kind: "prose",
+    markdown: `Partial ${done}/${total} batches saved. Resume the queue to finish.\n\n${result.markdown}`,
+  };
 }
 
 export function compactBatchForMerge(result: ReviewResult, paths: string[]): string {

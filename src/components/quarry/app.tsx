@@ -44,10 +44,24 @@ import { probeLmStudio, type LmStatus } from "@/lib/llm/lmstudio";
 import { parseReview } from "@/lib/review/parse";
 import { buildReviewMessages, buildSynthesisMessages } from "@/lib/review/prompt";
 import {
+  checkpointId,
+  checkpointMatchesRepo,
+  clearCheckpoint,
+  completedBatchCount,
+  loadCheckpoint,
+  pendingBatchIndexes,
+  saveCheckpoint,
+  writeBatchResult,
+  type QueueCheckpoint,
+} from "@/lib/review/checkpoint";
+import {
   BATCH_MAX_CHARS,
   compactBatchForMerge,
+  LM_STUDIO_CONCURRENCY,
+  markPartialReview,
   mergeReviewResults,
   queueReviewBatches,
+  runConcurrentIndexes,
   type ReviewQueueProgress,
 } from "@/lib/review/queue";
 import {
@@ -111,12 +125,19 @@ export function QuarryApp() {
   );
   const [result, setResult] = useState<ReviewResult | null>(null);
   const [providerLabel, setProviderLabel] = useState("");
+  const [checkpoint, setCheckpoint] = useState<QueueCheckpoint | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const checkpointRef = useRef<QueueCheckpoint | null>(null);
+  const runningRef = useRef<Set<number>>(new Set());
+  const streamBuffers = useRef<Map<number, string>>(new Map());
 
   useEffect(() => {
     const next = loadSettings();
     setSettings(next);
     setHistory(loadHistory());
+    const saved = loadCheckpoint();
+    checkpointRef.current = saved;
+    setCheckpoint(saved);
     void getGrokAvailability().then((value) => setGrokAvailable(value.grok));
     void probeLmStudio(next.lmStudioUrl).then((status) => {
       setLmStatus(status);
@@ -127,6 +148,16 @@ export function QuarryApp() {
       }
     });
   }, []);
+
+  useEffect(() => {
+    function onLeave(event: BeforeUnloadEvent) {
+      if (phase !== "reviewing") return;
+      event.preventDefault();
+      event.returnValue = "";
+    }
+    window.addEventListener("beforeunload", onLeave);
+    return () => window.removeEventListener("beforeunload", onLeave);
+  }, [phase]);
 
   function updateSettings(next: Settings) {
     setSettings(next);
@@ -170,15 +201,40 @@ export function QuarryApp() {
         return;
       }
       setBundle(res.data);
-      setSelected(res.data.selected);
+      const saved = checkpointRef.current;
+      if (
+        !keepResult &&
+        saved &&
+        checkpointMatchesRepo(saved, res.data.meta.owner, res.data.meta.repo)
+      ) {
+        setSelected(saved.selected);
+        setLens(saved.lens);
+        const parts = saved.results
+          .filter((item): item is NonNullable<typeof item> => Boolean(item))
+          .map((item) => item.result);
+        if (parts.length) {
+          setResult(
+            markPartialReview(
+              mergeReviewResults(parts),
+              parts.length,
+              saved.batches.length,
+            ),
+          );
+          setTab("review");
+        } else {
+          setTab("overview");
+        }
+      } else {
+        setSelected(res.data.selected);
+        if (keepResult) {
+          setResult(keepResult);
+          setTab("review");
+        } else {
+          setTab("overview");
+        }
+      }
       setContents(res.data.contents);
       setPhase("ready");
-      if (keepResult) {
-        setResult(keepResult);
-        setTab("review");
-      } else {
-        setTab("overview");
-      }
     } catch (err) {
       setPhase(bundle ? "ready" : "idle");
       setError(err instanceof Error ? err.message : "Could not open that repository.");
@@ -277,6 +333,45 @@ export function QuarryApp() {
 
     const controller = new AbortController();
     abortRef.current = controller;
+    runningRef.current = new Set();
+    streamBuffers.current = new Map();
+
+    const sizes = Object.fromEntries(
+      bundle.files.map((file) => [file.path, file.size]),
+    );
+
+    function publishProgress(job: QueueCheckpoint) {
+      const runningPaths = [...runningRef.current].flatMap(
+        (index) => job.batches[index] ?? [],
+      );
+      const done = completedBatchCount(job);
+      setCheckpoint(job);
+      setQueueProgress({
+        phase: "files",
+        batch: Math.min(job.batches.length, done + runningRef.current.size),
+        total: job.batches.length,
+        paths: runningPaths,
+      });
+    }
+
+    function showSavedPartial(job: QueueCheckpoint, message?: string) {
+      const parts = job.results
+        .filter((item): item is NonNullable<typeof item> => Boolean(item))
+        .map((item) => item.result);
+      if (parts.length) {
+        setResult(
+          markPartialReview(
+            mergeReviewResults(parts),
+            parts.length,
+            job.batches.length,
+          ),
+        );
+        setTab("review");
+      }
+      setQueueProgress(null);
+      setPhase("ready");
+      if (message) setError(message);
+    }
 
     try {
       const model =
@@ -291,72 +386,133 @@ export function QuarryApp() {
         target === "lmstudio" ? `LM Studio · ${model}` : "Grok 4.5";
       setProviderLabel(label);
 
-      const sizes = Object.fromEntries(
-        bundle.files.map((file) => [file.path, file.size]),
-      );
       const batches =
         target === "lmstudio"
           ? queueReviewBatches(paths, contents, sizes)
           : [paths];
+      const id = checkpointId({
+        owner: bundle.meta.owner,
+        repo: bundle.meta.repo,
+        lens,
+        selected: paths,
+      });
+      let job =
+        checkpointRef.current && checkpointRef.current.id === id
+          ? checkpointRef.current
+          : {
+              id,
+              updatedAt: Date.now(),
+              owner: bundle.meta.owner,
+              repo: bundle.meta.repo,
+              lens,
+              model,
+              selected: paths,
+              batches,
+              results: batches.map(() => null),
+            };
+      if (job.batches.length !== batches.length) {
+        job = { ...job, batches, results: batches.map((_, i) => job.results[i] ?? null) };
+      }
+      checkpointRef.current = job;
+      saveCheckpoint(job);
+      setCheckpoint(job);
 
       let loaded = contents;
-      const batchResults: ReviewResult[] = [];
-
-      for (let i = 0; i < batches.length; i += 1) {
-        const batchPaths = batches[i] ?? [];
-        setQueueProgress({
-          phase: "files",
-          batch: i + 1,
-          total: batches.length,
-          paths: batchPaths,
+      let fetchLock = Promise.resolve();
+      async function loadLocked(batchPaths: string[]) {
+        const previous = fetchLock;
+        let release = () => {};
+        fetchLock = new Promise<void>((resolve) => {
+          release = resolve;
         });
-        setStreamText("");
-        loaded = await ensureContents(batchPaths, loaded);
-
-        const budget =
-          target === "grok"
-            ? Math.min(Math.max(settings.maxChars, 48_000), 140_000)
-            : BATCH_MAX_CHARS;
-
-        const messages = buildReviewMessages({
-          meta: bundle.meta,
-          languages: bundle.languages,
-          allPaths: bundle.files.map((file) => file.path),
-          contents: loaded,
-          selected: batchPaths,
-          lens,
-          maxChars: budget,
-          treeLimit: batches.length > 1 ? 60 : 80,
-          findingHint: batches.length > 1 ? "Write 3 to 8 findings." : undefined,
-          batch:
-            batches.length > 1
-              ? { index: i + 1, total: batches.length }
-              : undefined,
-        });
-
-        const text = await completeChat({
-          target,
-          lmStudioUrl: settings.lmStudioUrl,
-          model,
-          messages,
-          temperature: settings.temperature,
-          signal: controller.signal,
-          onDelta: (chunk) => setStreamText((prev) => prev + chunk),
-        });
-        batchResults.push(parseReview(text));
+        await previous;
+        try {
+          loaded = await ensureContents(batchPaths, loaded);
+          return loaded;
+        } finally {
+          release();
+        }
       }
 
+      const pending = pendingBatchIndexes(job);
+      publishProgress(job);
+
+      await runConcurrentIndexes({
+        indexes: pending,
+        concurrency: target === "lmstudio" ? LM_STUDIO_CONCURRENCY : 1,
+        signal: controller.signal,
+        worker: async (index) => {
+          const batchPaths = job.batches[index] ?? [];
+          runningRef.current.add(index);
+          publishProgress(checkpointRef.current ?? job);
+          const batchContents = await loadLocked(batchPaths);
+          const budget =
+            target === "grok"
+              ? Math.min(Math.max(settings.maxChars, 48_000), 140_000)
+              : BATCH_MAX_CHARS;
+          const messages = buildReviewMessages({
+            meta: bundle.meta,
+            languages: bundle.languages,
+            allPaths: bundle.files.map((file) => file.path),
+            contents: batchContents,
+            selected: batchPaths,
+            lens,
+            maxChars: budget,
+            treeLimit: job.batches.length > 1 ? 60 : 80,
+            findingHint: job.batches.length > 1 ? "Write 3 to 8 findings." : undefined,
+            batch:
+              job.batches.length > 1
+                ? { index: index + 1, total: job.batches.length }
+                : undefined,
+          });
+          const text = await completeChat({
+            target,
+            lmStudioUrl: settings.lmStudioUrl,
+            model,
+            messages,
+            temperature: settings.temperature,
+            signal: controller.signal,
+            onDelta: (chunk) => {
+              const next = (streamBuffers.current.get(index) ?? "") + chunk;
+              streamBuffers.current.set(index, next);
+              const body = [...streamBuffers.current.entries()]
+                .sort((a, b) => a[0] - b[0])
+                .map(([batch, value]) => `--- batch ${batch + 1} ---\n${value.slice(-1800)}`)
+                .join("\n\n");
+              setStreamText(body);
+            },
+          });
+          const parsedBatch = parseReview(text);
+          const current = checkpointRef.current ?? job;
+          const nextJob = writeBatchResult(current, index, parsedBatch);
+          checkpointRef.current = nextJob;
+          runningRef.current.delete(index);
+          publishProgress(nextJob);
+        },
+      });
+
+      if (controller.signal.aborted) {
+        const current = checkpointRef.current;
+        if (current) showSavedPartial(current, "Queue paused. Completed batches are saved — Resume to continue.");
+        else setPhase("ready");
+        return;
+      }
+
+      const finished = checkpointRef.current ?? job;
+      const batchResults = finished.results.map((item) => item?.result).filter(
+        (item): item is ReviewResult => Boolean(item),
+      );
       let parsed = mergeReviewResults(batchResults);
-      if (target === "lmstudio" && batches.length > 1) {
+      if (target === "lmstudio" && finished.batches.length > 1 && batchResults.length === finished.batches.length) {
         setQueueProgress({
           phase: "merge",
-          batch: batches.length,
-          total: batches.length,
+          batch: finished.batches.length,
+          total: finished.batches.length,
           paths: [],
         });
         setStreamText("");
-        const notes = batchResults.map((part, i) =>
-          compactBatchForMerge(part, batches[i] ?? []),
+        const notes = finished.results.map((item, i) =>
+          compactBatchForMerge(item?.result ?? { kind: "prose", markdown: "" }, finished.batches[i] ?? []),
         );
         try {
           const mergeText = await completeChat({
@@ -367,7 +523,7 @@ export function QuarryApp() {
               meta: bundle.meta,
               lens,
               fileCount: paths.length,
-              batchCount: batches.length,
+              batchCount: finished.batches.length,
               notes,
             }),
             temperature: Math.min(settings.temperature, 0.3),
@@ -378,10 +534,25 @@ export function QuarryApp() {
           if (merged.kind === "structured") parsed = merged;
         } catch (err) {
           if (controller.signal.aborted) throw err;
-          // Keep the heuristic merge if the synthesis pass fails.
         }
       }
 
+      if (controller.signal.aborted) {
+        showSavedPartial(finished, "Queue paused. Completed batches are saved — Resume to continue.");
+        return;
+      }
+
+      if (batchResults.length < finished.batches.length) {
+        showSavedPartial(
+          finished,
+          `Saved ${batchResults.length} of ${finished.batches.length} batches. Resume to finish.`,
+        );
+        return;
+      }
+
+      clearCheckpoint();
+      checkpointRef.current = null;
+      setCheckpoint(null);
       setQueueProgress(null);
       setResult(parsed);
       setPhase("ready");
@@ -399,12 +570,21 @@ export function QuarryApp() {
       };
       setHistory((current) => pushHistory(record, current));
     } catch (err) {
+      const current = checkpointRef.current;
       if (controller.signal.aborted) {
-        setQueueProgress(null);
-        setPhase("ready");
+        if (current) {
+          showSavedPartial(current, "Queue paused. Completed batches are saved — Resume to continue.");
+        } else {
+          setQueueProgress(null);
+          setPhase("ready");
+        }
         return;
       }
       const message = err instanceof Error ? err.message : "Review failed.";
+      if (current && completedBatchCount(current) > 0) {
+        showSavedPartial(current, `${message} Completed batches are saved — Resume to continue.`);
+        return;
+      }
       setError(message);
       setQueueProgress(null);
       setPhase("ready");
@@ -413,8 +593,13 @@ export function QuarryApp() {
 
   function cancelReview() {
     abortRef.current?.abort();
-    setQueueProgress(null);
-    setPhase("ready");
+  }
+
+  function discardCheckpoint() {
+    clearCheckpoint();
+    checkpointRef.current = null;
+    setCheckpoint(null);
+    setError(null);
   }
 
   function reset() {
