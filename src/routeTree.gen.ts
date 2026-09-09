@@ -10,12 +10,18 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as ApiGithubSearchRouteImport } from './routes/api/github-search'
 import { Route as ApiLmRouteImport } from './routes/api/lm'
 import { Route as ApiReviewRouteImport } from './routes/api/review'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiGithubSearchRoute = ApiGithubSearchRouteImport.update({
+  id: '/api/github-search',
+  path: '/api/github-search',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ApiLmRoute = ApiLmRouteImport.update({
@@ -31,30 +37,34 @@ const ApiReviewRoute = ApiReviewRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/api/github-search': typeof ApiGithubSearchRoute
   '/api/lm': typeof ApiLmRoute
   '/api/review': typeof ApiReviewRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/api/github-search': typeof ApiGithubSearchRoute
   '/api/lm': typeof ApiLmRoute
   '/api/review': typeof ApiReviewRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/api/github-search': typeof ApiGithubSearchRoute
   '/api/lm': typeof ApiLmRoute
   '/api/review': typeof ApiReviewRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/api/lm' | '/api/review'
+  fullPaths: '/' | '/api/github-search' | '/api/lm' | '/api/review'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/api/lm' | '/api/review'
-  id: '__root__' | '/' | '/api/lm' | '/api/review'
+  to: '/' | '/api/github-search' | '/api/lm' | '/api/review'
+  id: '__root__' | '/' | '/api/github-search' | '/api/lm' | '/api/review'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  ApiGithubSearchRoute: typeof ApiGithubSearchRoute
   ApiLmRoute: typeof ApiLmRoute
   ApiReviewRoute: typeof ApiReviewRoute
 }
@@ -66,6 +76,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/github-search': {
+      id: '/api/github-search'
+      path: '/api/github-search'
+      fullPath: '/api/github-search'
+      preLoaderRoute: typeof ApiGithubSearchRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/lm': {
@@ -87,6 +104,7 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  ApiGithubSearchRoute: ApiGithubSearchRoute,
   ApiLmRoute: ApiLmRoute,
   ApiReviewRoute: ApiReviewRoute,
 }

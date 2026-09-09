@@ -46,6 +46,8 @@ export function buildReviewMessages(input: {
   treeLimit?: number;
   findingHint?: string;
   batch?: { index: number; total: number };
+  jobDigest?: string;
+  contextDigest?: string;
 }): { role: "system" | "user"; content: string }[] {
   const findingHint = input.findingHint ?? "Write 5 to 12 findings.";
   const system = [
@@ -54,9 +56,13 @@ export function buildReviewMessages(input: {
       ? "This repository is private. Treat secrets, credentials, and internal URLs as sensitive — report them, do not invent extra exposure."
       : "",
     "Be specific. Cite real paths. Do not invent files, APIs, or vulnerabilities.",
+    "Do not call process.env / Settings token usage a hardcoded secret.",
     "Prefer findings a maintainer could act on this week over generic advice.",
     input.batch && input.batch.total > 1
       ? `This is file batch ${input.batch.index} of ${input.batch.total}. Review ONLY the files in this batch. Do not claim you read the whole repo.`
+      : "",
+    input.jobDigest
+      ? "A job digest (PR, branch, or issue) follows. Stay on that work item."
       : "",
     "Return ONLY a JSON object matching this schema — no markdown fence, no preamble:",
     SCHEMA,
@@ -98,6 +104,8 @@ export function buildReviewMessages(input: {
     `License: ${input.meta.license ?? "n/a"}`,
     `Visibility: ${input.meta.private ? "private" : "public"}.`,
     `Stars: ${input.meta.stars}. Forks: ${input.meta.forks}. Branch: ${input.meta.defaultBranch}.`,
+    input.jobDigest ? `\n## Review job\n${input.jobDigest}` : "",
+    input.contextDigest ? `\n## Repo context\n${input.contextDigest}` : "",
     input.meta.pushedAt ? `Last push: ${input.meta.pushedAt}` : "",
     langLine ? `Languages: ${langLine}` : "",
     input.meta.topics.length ? `Topics: ${input.meta.topics.join(", ")}` : "",
@@ -148,4 +156,25 @@ export function buildSynthesisMessages(input: {
     { role: "system", content: system },
     { role: "user", content: user },
   ];
+}
+
+export function buildPatchReviewMessages(input: {
+  meta: RepoMeta;
+  lens: ReviewLens;
+  paths: string[];
+  contents: Record<string, string>;
+  maxChars: number;
+}): { role: "system" | "user"; content: string }[] {
+  return buildReviewMessages({
+    meta: input.meta,
+    languages: {},
+    allPaths: input.paths,
+    contents: input.contents,
+    selected: input.paths,
+    lens: input.lens,
+    maxChars: input.maxChars,
+    treeLimit: 40,
+    findingHint:
+      "Review ONLY these just-written files. Hunt for new bugs, leftover issues, and leaked secrets. Do not praise the patch unless it is actually sound.",
+  });
 }

@@ -4,6 +4,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import type { Finding, FindingSeverity, ReviewResult } from "@/lib/review/types";
 import { reviewToMarkdown } from "@/lib/review/parse";
+import { ApplyFixesPanel } from "@/components/quarry/apply-fixes";
+import type { BranchPushResult } from "@/lib/github/write";
 import { cn } from "@/lib/utils";
 
 const SEVERITY_VARIANT: Record<
@@ -63,6 +65,16 @@ export function Report({
   streamText,
   reviewing,
   queueProgress,
+  defaultBranch,
+  applying,
+  applyProgress,
+  applyResult,
+  applyError,
+  hasGithubToken,
+  onApplyFixes,
+  writeHint,
+  patchResult,
+  verifySummary,
 }: {
   owner: string;
   repo: string;
@@ -75,6 +87,16 @@ export function Report({
     total: number;
     paths: string[];
   } | null;
+  defaultBranch?: string;
+  applying?: boolean;
+  applyProgress?: string | null;
+  applyResult?: BranchPushResult | null;
+  applyError?: string | null;
+  hasGithubToken?: boolean;
+  onApplyFixes?: (findingIds: string[]) => void;
+  writeHint?: string;
+  patchResult?: ReviewResult | null;
+  verifySummary?: string | null;
 }) {
   if (reviewing) {
     const label =
@@ -191,6 +213,47 @@ export function Report({
           />
         </div>
       </section>
+
+      {onApplyFixes ? (
+        <ApplyFixesPanel
+          key={result.findings.map((item) => item.id).join(",")}
+          result={result}
+          defaultBranch={defaultBranch || "main"}
+          applying={Boolean(applying)}
+          progress={applyProgress ?? null}
+          applyResult={applyResult ?? null}
+          applyError={applyError ?? null}
+          hasToken={Boolean(hasGithubToken)}
+          writeHint={writeHint}
+          onApply={onApplyFixes}
+        />
+      ) : null}
+
+      {verifySummary ? (
+        <p className="text-sm text-muted-foreground whitespace-pre-wrap">{verifySummary}</p>
+      ) : null}
+
+      {patchResult?.kind === "structured" ? (
+        <section className="rounded-2xl bg-card p-5 shadow-[var(--shadow-border)]">
+          <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+            Patch re-review
+          </p>
+          <h3 className="mt-1 font-display text-xl tracking-tight">{patchResult.headline}</h3>
+          <p className="mt-2 text-sm text-muted-foreground">{patchResult.summary}</p>
+          <ul className="mt-3 space-y-2 text-sm">
+            {patchResult.findings.map((finding) => (
+              <li key={finding.id}>
+                <span className="font-medium">{finding.severity}</span> {finding.title}
+                {finding.file ? (
+                  <span className="block font-mono text-xs text-muted-foreground">
+                    {finding.file}
+                  </span>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
 
       {grouped.map((group) => (
         <section key={group.severity} className="space-y-3">

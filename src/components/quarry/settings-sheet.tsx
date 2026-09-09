@@ -130,7 +130,7 @@ export function SettingsSheet({
               onChange={(e) =>
                 onChange({ ...settings, lmStudioUrl: e.target.value })
               }
-              placeholder="http://100.66.236.13:1234/v1"
+              placeholder="http://127.0.0.1:1234/v1"
               autoCapitalize="off"
               autoCorrect="off"
               spellCheck={false}
@@ -202,13 +202,16 @@ export function SettingsSheet({
               onChange={(e) =>
                 onChange({ ...settings, githubToken: e.target.value })
               }
-              placeholder="ghp_…  Contents: Read for private repos"
+              placeholder="ghp_…  Contents + Pull requests"
               autoComplete="off"
             />
             <p className="text-sm text-muted-foreground">
-              Needed for private repos and for a higher public rate limit. Fine-grained:
-              Contents read on the repos you review. Classic: the repo scope. Stays on
-              this device.
+              Needed for listing the private repos you can access, a higher
+              public rate limit, and applying fixes on a new{" "}
+              <code>quarry/*</code> branch. Fine-grained: Metadata read, Contents
+              read and write, plus Pull requests write, on those repositories.
+              Classic: the repo scope. Stays on this device. Quarry never
+              commits to the default branch.
             </p>
           </section>
 

@@ -27,7 +27,7 @@ function asString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function extractJson(text: string): unknown | null {
+export function extractJson(text: string): unknown | null {
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const raw = fence?.[1] ?? text;
   const start = raw.indexOf("{");

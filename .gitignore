@@ -9,6 +9,7 @@ dist
 .env
 .env.local
 .env*.local
+quarry-dump.json
 screenshots
 artifacts
 .grok/og-pending

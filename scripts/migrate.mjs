@@ -18,12 +18,35 @@ import { dirname, join } from "node:path";
 import pg from "pg";
 import { pendingMigrations } from "./migration-plan.mjs";
 
-const databaseUrl = process.env.DATABASE_URL;
+const rawDatabaseUrl =
+  process.env.DATABASE_PUBLIC_URL?.trim() || process.env.DATABASE_URL?.trim();
+const databaseUrl = rewriteRailwayPublicUrl(rawDatabaseUrl);
 if (!databaseUrl) {
   console.log(
     "[migrate] DATABASE_URL not set — skipping (the PGLite fallback migrates itself).",
   );
   process.exit(0);
+}
+
+function rewriteRailwayPublicUrl(url) {
+  if (!url) return url;
+  const proxyHost = process.env.RAILWAY_TCP_PROXY_DOMAIN?.trim();
+  const proxyPort = process.env.RAILWAY_TCP_PROXY_PORT?.trim();
+  if (!proxyHost || !proxyPort || !/railway\.internal/i.test(url)) return url;
+  const at = url.indexOf("@");
+  if (at === -1) return url;
+  const slash = url.indexOf("/", at);
+  const path = slash === -1 ? "" : url.slice(slash);
+  return `${url.slice(0, at + 1)}${proxyHost}:${proxyPort}${path}`;
+}
+
+function poolConfig(url) {
+  const local = /localhost|127\.0\.0\.1/i.test(url);
+  return {
+    connectionString: url,
+    max: 1,
+    ssl: local ? false : { rejectUnauthorized: false },
+  };
 }
 
 const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
@@ -42,7 +65,7 @@ async function main() {
     return;
   }
 
-  const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
+  const pool = new pg.Pool(poolConfig(databaseUrl));
   const client = await pool.connect();
   try {
     await client.query(

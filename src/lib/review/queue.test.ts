@@ -4,6 +4,7 @@ import {
   BATCH_MAX_FILES,
   mergeReviewResults,
   queueReviewBatches,
+  runConcurrentIndexes,
 } from "./queue.ts";
 import type { StructuredReview } from "./types.ts";
 
@@ -79,4 +80,17 @@ test("mergeReviewResults keeps the higher severity duplicate", () => {
   assert.equal(merged.findings[0]?.severity, "high");
   assert.equal(merged.stack.includes("vite"), true);
   assert.equal(merged.questions.length, 1);
+});
+
+test("runConcurrentIndexes runs every index", async () => {
+  const seen: number[] = [];
+  await runConcurrentIndexes({
+    indexes: [0, 1, 2, 3],
+    concurrency: 2,
+    signal: new AbortController().signal,
+    worker: async (index) => {
+      seen.push(index);
+    },
+  });
+  assert.deepEqual(seen.sort((a, b) => a - b), [0, 1, 2, 3]);
 });

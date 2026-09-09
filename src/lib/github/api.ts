@@ -1,5 +1,6 @@
 import { parseRepoInput } from "./parse";
 import { listReviewableFiles, pickSmartFiles } from "./select";
+import { githubRequest } from "./client";
 import type {
   FileEntry,
   GithubResult,
@@ -7,6 +8,7 @@ import type {
   RepoMeta,
 } from "./types";
 import type { ReviewLens } from "@/lib/review/types";
+import type { Playbook } from "@/lib/playbook";
 
 type GhResponse<T> = {
   status: number;
@@ -18,24 +20,7 @@ async function gh<T>(
   path: string,
   token: string | undefined,
 ): Promise<GhResponse<T>> {
-  const headers: Record<string, string> = {
-    Accept: "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-  };
-  if (token) headers.Authorization = `Bearer ${token}`;
-
-  const res = await fetch(`https://api.github.com${path}`, { headers });
-  const remaining = res.headers.get("x-ratelimit-remaining");
-  let json: T = {} as T;
-  const text = await res.text();
-  if (text) {
-    try {
-      json = JSON.parse(text) as T;
-    } catch {
-      json = { message: text } as T;
-    }
-  }
-  return { status: res.status, json, remaining };
+  return githubRequest<T>("GET", path, token);
 }
 
 function fail(
@@ -136,11 +121,23 @@ type GhRepo = {
   message?: string;
 };
 
+type GitRef = { object?: { sha?: string }; message?: string };
+
 type GhTree = {
   truncated?: boolean;
   tree?: { path: string; type: string; sha: string; size?: number }[];
   message?: string;
 };
+
+function blobsFromTree(tree: GhTree): FileEntry[] {
+  return (tree.tree ?? [])
+    .filter((node) => node.type === "blob" && node.path)
+    .map((node) => ({
+      path: node.path,
+      size: node.size ?? 0,
+      sha: node.sha,
+    }));
+}
 
 type GhContent = {
   path?: string;
@@ -156,15 +153,17 @@ async function loadContents(
   repo: string,
   paths: string[],
   token: string | undefined,
+  ref?: string,
 ): Promise<Record<string, string>> {
     const unique = [...new Set(paths)].slice(0, 2000);
+    const refQuery = ref ? `?ref=${encodeURIComponent(ref)}` : "";
     const pairs = await mapPool(unique, 10, async (path) => {
     const encoded = path
       .split("/")
       .map((part) => encodeURIComponent(part))
       .join("/");
     const { status, json } = await gh<GhContent>(
-      `/repos/${owner}/${repo}/contents/${encoded}`,
+      `/repos/${owner}/${repo}/contents/${encoded}${refQuery}`,
       token,
     );
     if (status >= 400) return [path, ""] as const;
@@ -199,6 +198,7 @@ export async function openRepo(input: {
   lens?: ReviewLens;
   maxFiles?: number;
   maxChars?: number;
+  playbook?: Playbook | null;
 }): Promise<GithubResult<RepoBundle>> {
   const identity = parseRepoInput(input.source);
   if (!identity) {
@@ -269,17 +269,18 @@ export async function openRepo(input: {
     }
 
     const languages = langRes.status < 400 ? langRes.json : {};
-    const blobs: FileEntry[] = (treeRes.json.tree ?? [])
-      .filter((node) => node.type === "blob" && node.path)
-      .map((node) => ({
-        path: node.path,
-        size: node.size ?? 0,
-        sha: node.sha,
-      }));
+    const refRes = await gh<GitRef>(
+      `/repos/${meta.owner}/${meta.repo}/git/ref/heads/${encodeURIComponent(meta.defaultBranch)}`,
+      token,
+    );
+    const headSha = refRes.json.object?.sha || meta.defaultBranch;
+    const blobs = blobsFromTree(treeRes.json);
 
     const listed = listReviewableFiles(blobs, 2000);
-    const selected = pickSmartFiles(blobs, lens, maxFiles, maxChars);
-    const contents = await loadContents(meta.owner, meta.repo, selected, token);
+    const selected = pickSmartFiles(blobs, lens, maxFiles, maxChars, {
+      playbook: input.playbook,
+    });
+    const contents = await loadContents(meta.owner, meta.repo, selected, token, headSha);
 
     return {
       ok: true,
@@ -291,6 +292,8 @@ export async function openRepo(input: {
         contents,
         treeTruncated: Boolean(treeRes.json.truncated),
         listedTruncated: blobs.length > listed.length,
+        headSha,
+        headRef: meta.defaultBranch,
       },
     };
   } catch (err) {
@@ -304,6 +307,7 @@ export async function fetchFileContents(input: {
   repo: string;
   paths: string[];
   token?: string;
+  ref?: string;
 }): Promise<GithubResult<Record<string, string>>> {
   if (!input.owner || !input.repo || !input.paths.length) {
     return fail("Nothing to fetch.", "invalid");
@@ -314,10 +318,54 @@ export async function fetchFileContents(input: {
       input.repo,
       input.paths,
       input.token?.trim() || undefined,
+      input.ref,
     );
     return { ok: true, data: contents };
   } catch (err) {
     const message = err instanceof Error ? err.message : "Could not load files.";
     return fail(message, "network");
+  }
+}
+
+export async function loadBundleAtRef(input: {
+  owner: string;
+  repo: string;
+  token?: string;
+  ref: string;
+  sha: string;
+  lens: ReviewLens;
+  maxFiles: number;
+  maxChars: number;
+  extraPaths?: string[];
+  playbook?: Playbook | null;
+}): Promise<GithubResult<{ files: FileEntry[]; selected: string[]; contents: Record<string, string>; treeTruncated: boolean; listedTruncated: boolean }>> {
+  const token = input.token?.trim() || undefined;
+  try {
+    const treeRes = await gh<GhTree>(
+      `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/git/trees/${encodeURIComponent(input.sha)}?recursive=1`,
+      token,
+    );
+    if (treeRes.status >= 400) {
+      return mapStatus(treeRes.status, treeRes.remaining, treeRes.json.message, token);
+    }
+    const blobs = blobsFromTree(treeRes.json);
+    const listed = listReviewableFiles(blobs, 2000);
+    const selected = pickSmartFiles(blobs, input.lens, input.maxFiles, input.maxChars, {
+      extraPaths: input.extraPaths,
+      playbook: input.playbook,
+    });
+    const contents = await loadContents(input.owner, input.repo, selected, token, input.sha);
+    return {
+      ok: true,
+      data: {
+        files: listed,
+        selected,
+        contents,
+        treeTruncated: Boolean(treeRes.json.truncated),
+        listedTruncated: blobs.length > listed.length,
+      },
+    };
+  } catch (err) {
+    return fail(err instanceof Error ? err.message : "Could not load that ref.", "network");
   }
 }

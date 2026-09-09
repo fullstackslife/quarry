@@ -33,37 +33,83 @@ import { FileList } from "@/components/quarry/file-list";
 import { QuarryMark } from "@/components/quarry/mark";
 import { Report } from "@/components/quarry/report";
 import { SettingsSheet } from "@/components/quarry/settings-sheet";
-import { fetchFileContents, openRepo } from "@/lib/github/api";
+import { JobPicker } from "@/components/quarry/job-picker";
+import { PlaybookEditor } from "@/components/quarry/playbook-editor";
+import { CampaignsPanel } from "@/components/quarry/campaigns-panel";
+import { RolloutPanel } from "@/components/quarry/rollout-panel";
+import {
+  AccessibleReposPanel,
+  type AccessibleReposState,
+} from "@/components/quarry/accessible-repos";
+import { fetchFileContents, loadBundleAtRef, openRepo } from "@/lib/github/api";
+import { listAccessibleRepos } from "@/lib/github/repos";
+import { searchCodeRepos } from "@/lib/github/search";
+import {
+  defaultReviewJob,
+  extractMentionedPaths,
+  formatJobDigest,
+  listRepoJobs,
+  resolveReviewJob,
+  type JobListItem,
+  type ReviewJob,
+} from "@/lib/github/jobs";
+import { formatContextDigest, loadRepoContext } from "@/lib/github/context";
+import { appendPullBody, formatVerifySection, pollCommitChecks } from "@/lib/github/checks";
+import { resolveFixWriteTarget } from "@/lib/github/write-target";
+import { commitJobFixes, type BranchPushResult } from "@/lib/github/write";
+import { parseFileChanges } from "@/lib/fix/parse";
+import { buildFixFileMessages, groupFindingsByFile } from "@/lib/fix/prompt";
 import { parseRepoInput } from "@/lib/github/parse";
 import { pickSmartFiles } from "@/lib/github/select";
 import type { RepoBundle } from "@/lib/github/types";
-import { loadHistory, pushHistory } from "@/lib/history";
+import {
+  exportHistoryJson,
+  exportHistoryMarkdown,
+  lastReviewIndex,
+  loadHistory,
+  parseHistoryImport,
+  pushHistory,
+  saveHistory,
+} from "@/lib/history";
+import { buildOperatorDump, exportOperatorDumpJson } from "@/lib/sync/dump";
+import { addWatchlistPins, loadWatchlist, toggleWatchlist } from "@/lib/watchlist";
+import {
+  emptyPlaybook,
+  loadDefaultPlaybook,
+  loadPlaybooks,
+  playbookKey,
+  resolvePlaybook,
+  saveDefaultPlaybook,
+  upsertPlaybook,
+  type Playbook,
+} from "@/lib/playbook";
+import { groupCampaigns } from "@/lib/review/campaigns";
 import { getGrokAvailability } from "@/lib/llm/availability";
 import { completeChat } from "@/lib/llm/complete";
 import { probeLmStudio, type LmStatus } from "@/lib/llm/lmstudio";
 import { parseReview } from "@/lib/review/parse";
-import { buildReviewMessages, buildSynthesisMessages } from "@/lib/review/prompt";
+import { buildPatchReviewMessages } from "@/lib/review/prompt";
 import {
-  checkpointId,
   checkpointMatchesRepo,
   clearCheckpoint,
   completedBatchCount,
   loadCheckpoint,
   pendingBatchIndexes,
-  saveCheckpoint,
-  writeBatchResult,
   type QueueCheckpoint,
 } from "@/lib/review/checkpoint";
+import { markPartialReview, mergeReviewResults, type ReviewQueueProgress } from "@/lib/review/queue";
+import { runQueuedReview } from "@/lib/review/run-queued";
 import {
-  BATCH_MAX_CHARS,
-  compactBatchForMerge,
-  LM_STUDIO_CONCURRENCY,
-  markPartialReview,
-  mergeReviewResults,
-  queueReviewBatches,
-  runConcurrentIndexes,
-  type ReviewQueueProgress,
-} from "@/lib/review/queue";
+  clearRollout,
+  createRollout,
+  isRolloutFinished,
+  loadRollout,
+  markRolloutRepo,
+  nextPendingRepo,
+  rolloutCounts,
+  saveRollout,
+  type RolloutJob,
+} from "@/lib/review/rollout";
 import {
   LENSES,
   type ReviewLens,
@@ -126,15 +172,44 @@ export function QuarryApp() {
   const [result, setResult] = useState<ReviewResult | null>(null);
   const [providerLabel, setProviderLabel] = useState("");
   const [checkpoint, setCheckpoint] = useState<QueueCheckpoint | null>(null);
+  const [applying, setApplying] = useState(false);
+  const [applyProgress, setApplyProgress] = useState<string | null>(null);
+  const [applyResult, setApplyResult] = useState<BranchPushResult | null>(null);
+  const [applyError, setApplyError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const abortFixRef = useRef<AbortController | null>(null);
   const checkpointRef = useRef<QueueCheckpoint | null>(null);
-  const runningRef = useRef<Set<number>>(new Set());
-  const streamBuffers = useRef<Map<number, string>>(new Map());
+  const [accessible, setAccessible] = useState<AccessibleReposState>({
+    status: "idle",
+  });
+  const [accessibleTick, setAccessibleTick] = useState(0);
+  const [pins, setPins] = useState<string[]>([]);
+  const [playbooks, setPlaybooks] = useState<Record<string, Playbook>>({});
+  const [defaultPlaybook, setDefaultPlaybook] = useState<Playbook>(() => emptyPlaybook());
+  const [rollout, setRollout] = useState<RolloutJob | null>(null);
+  const [rolloutBusy, setRolloutBusy] = useState(false);
+  const [searchingCode, setSearchingCode] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [searchNote, setSearchNote] = useState<string | null>(null);
+  const [reviewJob, setReviewJob] = useState<ReviewJob | null>(null);
+  const [jobLists, setJobLists] = useState<{
+    pulls: JobListItem[];
+    branches: JobListItem[];
+    issues: JobListItem[];
+  }>({ pulls: [], branches: [], issues: [] });
+  const [jobLoading, setJobLoading] = useState(false);
+  const [repoContext, setRepoContext] = useState("");
+  const [patchResult, setPatchResult] = useState<ReviewResult | null>(null);
+  const [verifySummary, setVerifySummary] = useState<string | null>(null);
 
   useEffect(() => {
     const next = loadSettings();
     setSettings(next);
     setHistory(loadHistory());
+    setPins(loadWatchlist());
+    setPlaybooks(loadPlaybooks());
+    setDefaultPlaybook(loadDefaultPlaybook());
+    setRollout(loadRollout());
     const saved = loadCheckpoint();
     checkpointRef.current = saved;
     setCheckpoint(saved);
@@ -151,13 +226,78 @@ export function QuarryApp() {
 
   useEffect(() => {
     function onLeave(event: BeforeUnloadEvent) {
-      if (phase !== "reviewing") return;
+      if (phase !== "reviewing" && !applying && !rolloutBusy) return;
       event.preventDefault();
       event.returnValue = "";
     }
     window.addEventListener("beforeunload", onLeave);
     return () => window.removeEventListener("beforeunload", onLeave);
-  }, [phase]);
+  }, [phase, applying, rolloutBusy]);
+
+  useEffect(() => {
+    const token = settings.githubToken.trim();
+    if (!token) {
+      setAccessible({ status: "idle" });
+      return;
+    }
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      setAccessible({ status: "loading" });
+      void listAccessibleRepos({ token, signal: controller.signal })
+        .then((res) => {
+          if (controller.signal.aborted) return;
+          if (!res.ok) {
+            setAccessible({ status: "error", error: res.error });
+            return;
+          }
+          setAccessible({
+            status: "ready",
+            login: res.data.login,
+            repos: res.data.repos,
+            truncated: res.data.truncated,
+          });
+        })
+        .catch((err: unknown) => {
+          if (err instanceof Error && err.name === "AbortError") return;
+          if (controller.signal.aborted) return;
+          setAccessible({
+            status: "error",
+            error:
+              err instanceof Error
+                ? err.message
+                : "Could not list repositories.",
+          });
+        });
+    }, 400);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [settings.githubToken, accessibleTick]);
+
+  useEffect(() => {
+    if (!bundle) {
+      setJobLists({ pulls: [], branches: [], issues: [] });
+      return;
+    }
+    const token = settings.githubToken.trim();
+    if (!token) return;
+    const controller = new AbortController();
+    void listRepoJobs({
+      owner: bundle.meta.owner,
+      repo: bundle.meta.repo,
+      token,
+      signal: controller.signal,
+    })
+      .then((res) => {
+        if (controller.signal.aborted || !res.ok) return;
+        setJobLists(res.data);
+      })
+      .catch((err: unknown) => {
+        if (err instanceof Error && err.name === "AbortError") return;
+      });
+    return () => controller.abort();
+  }, [bundle, settings.githubToken]);
 
   function updateSettings(next: Settings) {
     setSettings(next);
@@ -180,6 +320,11 @@ export function QuarryApp() {
       return;
     }
     abortRef.current?.abort();
+    abortFixRef.current?.abort();
+    setApplying(false);
+    setApplyProgress(null);
+    setApplyResult(null);
+    setApplyError(null);
     setError(null);
     if (!keepResult) {
       setResult(null);
@@ -188,12 +333,18 @@ export function QuarryApp() {
     setPhase("loading");
     setSource(`${identity.owner}/${identity.repo}`);
     try {
+      const playbook = resolvePlaybook(
+        playbooks[playbookKey(identity.owner, identity.repo)],
+        defaultPlaybook,
+      );
+      const reviewLens = playbook.lens ?? lens;
       const res = await openRepo({
         source: raw,
         token: settings.githubToken || undefined,
-        lens,
+        lens: reviewLens,
         maxFiles: settings.maxFiles,
         maxChars: settings.maxChars,
+        playbook,
       });
       if (!res.ok) {
         setPhase(bundle ? "ready" : "idle");
@@ -234,7 +385,24 @@ export function QuarryApp() {
         }
       }
       setContents(res.data.contents);
+      setReviewJob(
+        defaultReviewJob(res.data.meta.defaultBranch, res.data.headSha),
+      );
+      setPatchResult(null);
+      setVerifySummary(null);
       setPhase("ready");
+      const token = settings.githubToken.trim();
+      if (token) {
+        void loadRepoContext({
+          owner: res.data.meta.owner,
+          repo: res.data.meta.repo,
+          token,
+          sha: res.data.headSha,
+          defaultBranch: res.data.meta.defaultBranch,
+        }).then((digest) => setRepoContext(formatContextDigest(digest)));
+      } else {
+        setRepoContext("");
+      }
     } catch (err) {
       setPhase(bundle ? "ready" : "idle");
       setError(err instanceof Error ? err.message : "Could not open that repository.");
@@ -251,8 +419,22 @@ export function QuarryApp() {
 
   function applySmart() {
     if (!bundle) return;
+    const playbook = resolvePlaybook(
+      playbooks[playbookKey(bundle.meta.owner, bundle.meta.repo)],
+      defaultPlaybook,
+    );
+    const extras = [
+      ...(reviewJob?.comparePaths ?? []),
+      ...extractMentionedPaths(
+        `${reviewJob?.body ?? ""}\n${(reviewJob?.comments ?? []).join("\n")}`,
+        bundle.files.map((file) => file.path),
+      ),
+    ];
     setSelected(
-      pickSmartFiles(bundle.files, lens, settings.maxFiles, settings.maxChars),
+      pickSmartFiles(bundle.files, lens, settings.maxFiles, settings.maxChars, {
+        extraPaths: extras,
+        playbook,
+      }),
     );
   }
 
@@ -276,6 +458,7 @@ export function QuarryApp() {
       repo: bundle.meta.repo,
       paths: missing,
       token: settings.githubToken || undefined,
+      ref: reviewJob?.sha || bundle.headSha,
     });
     if (!res.ok) {
       throw new Error(res.error);
@@ -285,15 +468,92 @@ export function QuarryApp() {
     return merged;
   }
 
-  async function runReview() {
+  async function selectJob(item: JobListItem | { kind: "default" }) {
     if (!bundle) return;
-    if (!resolvedTarget) {
-      setError(
-        "No model is available. Connect LM Studio in Settings, or wait for hosted review.",
+    const token = settings.githubToken.trim();
+    setJobLoading(true);
+    setError(null);
+    try {
+      const resolved = await resolveReviewJob({
+        owner: bundle.meta.owner,
+        repo: bundle.meta.repo,
+        token,
+        defaultBranch: bundle.meta.defaultBranch,
+        defaultSha: bundle.headSha,
+        item,
+      });
+      if (!resolved.ok) {
+        setError(resolved.error);
+        return;
+      }
+      const playbook = resolvePlaybook(
+        playbooks[playbookKey(bundle.meta.owner, bundle.meta.repo)],
+        defaultPlaybook,
       );
-      setSettingsOpen(true);
-      return;
+      const tree = await loadBundleAtRef({
+        owner: bundle.meta.owner,
+        repo: bundle.meta.repo,
+        token,
+        ref: resolved.data.head,
+        sha: resolved.data.sha,
+        lens: playbook.lens ?? lens,
+        maxFiles: settings.maxFiles,
+        maxChars: settings.maxChars,
+        extraPaths: resolved.data.comparePaths,
+        playbook,
+      });
+      if (!tree.ok) {
+        setError(tree.error);
+        return;
+      }
+      const mentioned = extractMentionedPaths(
+        `${resolved.data.body}\n${resolved.data.comments.join("\n")}`,
+        tree.data.files.map((file) => file.path),
+      );
+      const selectedPaths = pickSmartFiles(
+        tree.data.files,
+        playbook.lens ?? lens,
+        settings.maxFiles,
+        settings.maxChars,
+        {
+          extraPaths: [...resolved.data.comparePaths, ...mentioned],
+          playbook,
+        },
+      );
+      setReviewJob(resolved.data);
+      setBundle({
+        ...bundle,
+        files: tree.data.files,
+        selected: selectedPaths,
+        contents: tree.data.contents,
+        treeTruncated: tree.data.treeTruncated,
+        listedTruncated: tree.data.listedTruncated,
+        headSha: resolved.data.sha,
+        headRef: resolved.data.head,
+      });
+      setSelected(selectedPaths);
+      setContents(tree.data.contents);
+      if (token) {
+        const digest = await loadRepoContext({
+          owner: bundle.meta.owner,
+          repo: bundle.meta.repo,
+          token,
+          sha: resolved.data.sha,
+          defaultBranch: bundle.meta.defaultBranch,
+        });
+        setRepoContext(formatContextDigest(digest));
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not load that job.");
+    } finally {
+      setJobLoading(false);
     }
+  }
+
+  async function resolveModelTarget(): Promise<{
+    target: "lmstudio" | "grok";
+    model: string;
+  } | null> {
     let target = resolvedTarget;
     let lmModels: string[] =
       lmStatus.state === "online" ? lmStatus.models : [];
@@ -303,7 +563,7 @@ export function QuarryApp() {
       if (status.state !== "online") {
         setError(status.reason);
         setSettingsOpen(true);
-        return;
+        return null;
       }
       lmModels = status.models;
       target = "lmstudio";
@@ -311,16 +571,44 @@ export function QuarryApp() {
         updateSettings({ ...settings, lmStudioModel: status.models[0] });
       }
     }
+    if (target !== "lmstudio" && target !== "grok") {
+      setError(
+        "No model is available. Connect LM Studio in Settings, or wait for hosted review.",
+      );
+      setSettingsOpen(true);
+      return null;
+    }
+    const model =
+      target === "lmstudio"
+        ? settings.lmStudioModel || lmModels[0] || ""
+        : "grok-4.5";
+    if (target === "lmstudio" && !model) {
+      setError("Pick a loaded LM Studio model in Settings.");
+      setSettingsOpen(true);
+      return null;
+    }
+    return { target, model };
+  }
 
+  function rememberCheckpoint(job: QueueCheckpoint | null) {
+    checkpointRef.current = job;
+    setCheckpoint(job);
+  }
+
+  async function runReview() {
+    abortFixRef.current?.abort();
+    setApplying(false);
+    setApplyProgress(null);
+    setApplyResult(null);
+    setApplyError(null);
+    if (!bundle) return;
+    const prepared = await resolveModelTarget();
+    if (!prepared) return;
     const paths =
-      target === "grok" ? selected.slice(0, settings.maxFiles) : selected;
+      prepared.target === "grok" ? selected.slice(0, settings.maxFiles) : selected;
     if (paths.length === 0) {
       setError("Select at least one file to review.");
       setTab("files");
-      return;
-    }
-    if (target !== "lmstudio" && target !== "grok") {
-      setError("No model is available.");
       return;
     }
 
@@ -333,266 +621,446 @@ export function QuarryApp() {
 
     const controller = new AbortController();
     abortRef.current = controller;
-    runningRef.current = new Set();
-    streamBuffers.current = new Map();
-
-    const sizes = Object.fromEntries(
-      bundle.files.map((file) => [file.path, file.size]),
-    );
-
-    function publishProgress(job: QueueCheckpoint) {
-      const runningPaths = [...runningRef.current].flatMap(
-        (index) => job.batches[index] ?? [],
-      );
-      const done = completedBatchCount(job);
-      setCheckpoint(job);
-      setQueueProgress({
-        phase: "files",
-        batch: Math.min(job.batches.length, done + runningRef.current.size),
-        total: job.batches.length,
-        paths: runningPaths,
+    try {
+      const outcome = await runQueuedReview({
+        bundle,
+        selected: paths,
+        contents,
+        lens,
+        target: prepared.target,
+        lmStudioUrl: settings.lmStudioUrl,
+        model: prepared.model,
+        temperature: settings.temperature,
+        maxFiles: settings.maxFiles,
+        maxChars: settings.maxChars,
+        jobDigest: reviewJob ? formatJobDigest(reviewJob) : undefined,
+        contextDigest: repoContext || undefined,
+        signal: controller.signal,
+        existingCheckpoint: checkpointRef.current,
+        onCheckpoint: rememberCheckpoint,
+        onProgress: setQueueProgress,
+        onStream: setStreamText,
+        loadContents: (batchPaths, base) => ensureContents(batchPaths, base),
       });
-    }
-
-    function showSavedPartial(job: QueueCheckpoint, message?: string) {
-      const parts = job.results
-        .filter((item): item is NonNullable<typeof item> => Boolean(item))
-        .map((item) => item.result);
-      if (parts.length) {
-        setResult(
-          markPartialReview(
-            mergeReviewResults(parts),
-            parts.length,
-            job.batches.length,
+      setProviderLabel(outcome.providerLabel);
+      if (outcome.status === "complete" && outcome.result) {
+        const reviewed = outcome.result;
+        setQueueProgress(null);
+        setResult(reviewed);
+        setPhase("ready");
+        setHistory((current) =>
+          pushHistory(
+            {
+              id: `${bundle.meta.owner}/${bundle.meta.repo}-${Date.now()}`,
+              savedAt: Date.now(),
+              owner: bundle.meta.owner,
+              repo: bundle.meta.repo,
+              description: bundle.meta.description,
+              stars: bundle.meta.stars,
+              language: bundle.meta.language,
+              lens,
+              providerLabel: outcome.providerLabel,
+              result: reviewed,
+            },
+            current,
           ),
         );
+        return;
+      }
+      if (outcome.result) {
+        setResult(outcome.result);
         setTab("review");
       }
       setQueueProgress(null);
       setPhase("ready");
-      if (message) setError(message);
-    }
-
-    try {
-      const model =
-        target === "lmstudio"
-          ? settings.lmStudioModel || lmModels[0] || ""
-          : "grok-4.5";
-      if (target === "lmstudio" && !model) {
-        throw new Error("Pick a loaded LM Studio model in Settings.");
-      }
-
-      const label =
-        target === "lmstudio" ? `LM Studio · ${model}` : "Grok 4.5";
-      setProviderLabel(label);
-
-      const batches =
-        target === "lmstudio"
-          ? queueReviewBatches(paths, contents, sizes)
-          : [paths];
-      const id = checkpointId({
-        owner: bundle.meta.owner,
-        repo: bundle.meta.repo,
-        lens,
-        selected: paths,
-      });
-      let job =
-        checkpointRef.current && checkpointRef.current.id === id
-          ? checkpointRef.current
-          : {
-              id,
-              updatedAt: Date.now(),
-              owner: bundle.meta.owner,
-              repo: bundle.meta.repo,
-              lens,
-              model,
-              selected: paths,
-              batches,
-              results: batches.map(() => null),
-            };
-      if (job.batches.length !== batches.length) {
-        job = { ...job, batches, results: batches.map((_, i) => job.results[i] ?? null) };
-      }
-      checkpointRef.current = job;
-      saveCheckpoint(job);
-      setCheckpoint(job);
-
-      let loaded = contents;
-      let fetchLock = Promise.resolve();
-      async function loadLocked(batchPaths: string[]) {
-        const previous = fetchLock;
-        let release = () => {};
-        fetchLock = new Promise<void>((resolve) => {
-          release = resolve;
-        });
-        await previous;
-        try {
-          loaded = await ensureContents(batchPaths, loaded);
-          return loaded;
-        } finally {
-          release();
-        }
-      }
-
-      const pending = pendingBatchIndexes(job);
-      publishProgress(job);
-
-      await runConcurrentIndexes({
-        indexes: pending,
-        concurrency: target === "lmstudio" ? LM_STUDIO_CONCURRENCY : 1,
-        signal: controller.signal,
-        worker: async (index) => {
-          const batchPaths = job.batches[index] ?? [];
-          runningRef.current.add(index);
-          publishProgress(checkpointRef.current ?? job);
-          const batchContents = await loadLocked(batchPaths);
-          const budget =
-            target === "grok"
-              ? Math.min(Math.max(settings.maxChars, 48_000), 140_000)
-              : BATCH_MAX_CHARS;
-          const messages = buildReviewMessages({
-            meta: bundle.meta,
-            languages: bundle.languages,
-            allPaths: bundle.files.map((file) => file.path),
-            contents: batchContents,
-            selected: batchPaths,
-            lens,
-            maxChars: budget,
-            treeLimit: job.batches.length > 1 ? 60 : 80,
-            findingHint: job.batches.length > 1 ? "Write 3 to 8 findings." : undefined,
-            batch:
-              job.batches.length > 1
-                ? { index: index + 1, total: job.batches.length }
-                : undefined,
-          });
-          const text = await completeChat({
-            target,
-            lmStudioUrl: settings.lmStudioUrl,
-            model,
-            messages,
-            temperature: settings.temperature,
-            signal: controller.signal,
-            onDelta: (chunk) => {
-              const next = (streamBuffers.current.get(index) ?? "") + chunk;
-              streamBuffers.current.set(index, next);
-              const body = [...streamBuffers.current.entries()]
-                .sort((a, b) => a[0] - b[0])
-                .map(([batch, value]) => `--- batch ${batch + 1} ---\n${value.slice(-1800)}`)
-                .join("\n\n");
-              setStreamText(body);
-            },
-          });
-          const parsedBatch = parseReview(text);
-          const current = checkpointRef.current ?? job;
-          const nextJob = writeBatchResult(current, index, parsedBatch);
-          checkpointRef.current = nextJob;
-          runningRef.current.delete(index);
-          publishProgress(nextJob);
-        },
-      });
-
-      if (controller.signal.aborted) {
-        const current = checkpointRef.current;
-        if (current) showSavedPartial(current, "Queue paused. Completed batches are saved — Resume to continue.");
-        else setPhase("ready");
-        return;
-      }
-
-      const finished = checkpointRef.current ?? job;
-      const batchResults = finished.results.map((item) => item?.result).filter(
-        (item): item is ReviewResult => Boolean(item),
-      );
-      let parsed = mergeReviewResults(batchResults);
-      if (target === "lmstudio" && finished.batches.length > 1 && batchResults.length === finished.batches.length) {
-        setQueueProgress({
-          phase: "merge",
-          batch: finished.batches.length,
-          total: finished.batches.length,
-          paths: [],
-        });
-        setStreamText("");
-        const notes = finished.results.map((item, i) =>
-          compactBatchForMerge(item?.result ?? { kind: "prose", markdown: "" }, finished.batches[i] ?? []),
-        );
-        try {
-          const mergeText = await completeChat({
-            target,
-            lmStudioUrl: settings.lmStudioUrl,
-            model,
-            messages: buildSynthesisMessages({
-              meta: bundle.meta,
-              lens,
-              fileCount: paths.length,
-              batchCount: finished.batches.length,
-              notes,
-            }),
-            temperature: Math.min(settings.temperature, 0.3),
-            signal: controller.signal,
-            onDelta: (chunk) => setStreamText((prev) => prev + chunk),
-          });
-          const merged = parseReview(mergeText);
-          if (merged.kind === "structured") parsed = merged;
-        } catch (err) {
-          if (controller.signal.aborted) throw err;
-        }
-      }
-
-      if (controller.signal.aborted) {
-        showSavedPartial(finished, "Queue paused. Completed batches are saved — Resume to continue.");
-        return;
-      }
-
-      if (batchResults.length < finished.batches.length) {
-        showSavedPartial(
-          finished,
-          `Saved ${batchResults.length} of ${finished.batches.length} batches. Resume to finish.`,
-        );
-        return;
-      }
-
-      clearCheckpoint();
-      checkpointRef.current = null;
-      setCheckpoint(null);
-      setQueueProgress(null);
-      setResult(parsed);
-      setPhase("ready");
-      const record: ReviewRecord = {
-        id: `${bundle.meta.owner}/${bundle.meta.repo}-${Date.now()}`,
-        savedAt: Date.now(),
-        owner: bundle.meta.owner,
-        repo: bundle.meta.repo,
-        description: bundle.meta.description,
-        stars: bundle.meta.stars,
-        language: bundle.meta.language,
-        lens,
-        providerLabel: label,
-        result: parsed,
-      };
-      setHistory((current) => pushHistory(record, current));
+      if (outcome.message) setError(outcome.message);
     } catch (err) {
-      const current = checkpointRef.current;
       if (controller.signal.aborted) {
-        if (current) {
-          showSavedPartial(current, "Queue paused. Completed batches are saved — Resume to continue.");
-        } else {
-          setQueueProgress(null);
-          setPhase("ready");
-        }
+        setQueueProgress(null);
+        setPhase("ready");
         return;
       }
-      const message = err instanceof Error ? err.message : "Review failed.";
-      if (current && completedBatchCount(current) > 0) {
-        showSavedPartial(current, `${message} Completed batches are saved — Resume to continue.`);
-        return;
-      }
-      setError(message);
+      setError(err instanceof Error ? err.message : "Review failed.");
       setQueueProgress(null);
       setPhase("ready");
     }
   }
 
+  async function findAndPin(query: string) {
+    const token = settings.githubToken.trim();
+    setSearchError(null);
+    setSearchNote(null);
+    setSearchingCode(true);
+    try {
+      const res = await searchCodeRepos({ query, token });
+      if (!res.ok) {
+        setSearchError(res.error);
+        return;
+      }
+      setPins((current) => addWatchlistPins(current, res.data.repos));
+      const extra = res.data.truncated
+        ? " More matches exist; GitHub search is capped."
+        : "";
+      setSearchNote(
+        res.data.repos.length
+          ? `Pinned ${res.data.repos.length} repos from code search (${res.data.total} file hits).${extra}`
+          : `No repositories matched “${query.trim()}”.`,
+      );
+    } catch (err) {
+      setSearchError(err instanceof Error ? err.message : "Code search failed.");
+    } finally {
+      setSearchingCode(false);
+    }
+  }
+
+  async function runRollout(existing?: RolloutJob | null) {
+    if (!pins.length && !existing?.repos.length) {
+      setError("Pin at least one repository.");
+      return;
+    }
+    const prepared = await resolveModelTarget();
+    if (!prepared) return;
+
+    const token = settings.githubToken.trim();
+    let job =
+      existing && !isRolloutFinished(existing)
+        ? existing
+        : createRollout(pins, defaultPlaybook.lens ?? lens, defaultPlaybook);
+    saveRollout(job);
+    setRollout(job);
+    setRolloutBusy(true);
+    setError(null);
+    setStreamText("");
+    setQueueProgress(null);
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    try {
+      while (!controller.signal.aborted) {
+        const fullName = nextPendingRepo(job);
+        if (!fullName) break;
+        job = markRolloutRepo(job, fullName, "running");
+        setRollout(job);
+
+        const identity = parseRepoInput(fullName);
+        if (!identity) {
+          job = markRolloutRepo(job, fullName, "skipped", "Invalid repository name.");
+          setRollout(job);
+          continue;
+        }
+        const playbook = resolvePlaybook(
+          playbooks[playbookKey(identity.owner, identity.repo)],
+          job.playbook,
+        );
+        const reviewLens = playbook.lens ?? job.lens;
+        const opened = await openRepo({
+          source: fullName,
+          token: token || undefined,
+          lens: reviewLens,
+          maxFiles: settings.maxFiles,
+          maxChars: settings.maxChars,
+          playbook,
+        });
+        if (!opened.ok) {
+          job = markRolloutRepo(job, fullName, "error", opened.error);
+          setRollout(job);
+          continue;
+        }
+        if (opened.data.selected.length === 0) {
+          job = markRolloutRepo(
+            job,
+            fullName,
+            "skipped",
+            "No files matched the playbook.",
+          );
+          setRollout(job);
+          continue;
+        }
+
+        try {
+          const outcome = await runQueuedReview({
+            bundle: opened.data,
+            selected: opened.data.selected,
+            contents: opened.data.contents,
+            lens: reviewLens,
+            target: prepared.target,
+            lmStudioUrl: settings.lmStudioUrl,
+            model: prepared.model,
+            temperature: settings.temperature,
+            maxFiles: settings.maxFiles,
+            maxChars: settings.maxChars,
+            signal: controller.signal,
+            existingCheckpoint: checkpointRef.current,
+            onCheckpoint: rememberCheckpoint,
+            onProgress: setQueueProgress,
+            onStream: setStreamText,
+            loadContents: async (batchPaths, base) => {
+              const missing = batchPaths.filter((path) => !base[path]);
+              if (missing.length === 0) return base;
+              const res = await fetchFileContents({
+                owner: opened.data.meta.owner,
+                repo: opened.data.meta.repo,
+                paths: missing,
+                token: token || undefined,
+                ref: opened.data.headSha,
+              });
+              if (!res.ok) throw new Error(res.error);
+              return { ...base, ...res.data };
+            },
+          });
+          setProviderLabel(outcome.providerLabel);
+          if (outcome.status === "complete" && outcome.result) {
+            const reviewed = outcome.result;
+            setHistory((current) =>
+              pushHistory(
+                {
+                  id: `${opened.data.meta.owner}/${opened.data.meta.repo}-${Date.now()}`,
+                  savedAt: Date.now(),
+                  owner: opened.data.meta.owner,
+                  repo: opened.data.meta.repo,
+                  description: opened.data.meta.description,
+                  stars: opened.data.meta.stars,
+                  language: opened.data.meta.language,
+                  lens: reviewLens,
+                  providerLabel: outcome.providerLabel,
+                  result: reviewed,
+                },
+                current,
+              ),
+            );
+            job = markRolloutRepo(job, fullName, "done");
+          } else if (outcome.status === "paused") {
+            job = markRolloutRepo(job, fullName, "pending");
+            setRollout(job);
+            if (outcome.message) setError(outcome.message);
+            break;
+          } else {
+            job = markRolloutRepo(
+              job,
+              fullName,
+              "error",
+              outcome.message || "Review did not finish.",
+            );
+          }
+          setRollout(job);
+        } catch (err) {
+          if (controller.signal.aborted) {
+            job = markRolloutRepo(job, fullName, "pending");
+            setRollout(job);
+            break;
+          }
+          job = markRolloutRepo(
+            job,
+            fullName,
+            "error",
+            err instanceof Error ? err.message : "Review failed.",
+          );
+          setRollout(job);
+        }
+      }
+    } finally {
+      setRolloutBusy(false);
+      setQueueProgress(null);
+      if (job && isRolloutFinished(job)) {
+        const counts = rolloutCounts(job);
+        setSearchNote(
+          `Rollout finished: ${counts.done} reviewed, ${counts.error} error, ${counts.skipped} skipped.`,
+        );
+      }
+    }
+  }
+
+  function dismissRollout() {
+    clearRollout();
+    setRollout(null);
+  }
   function cancelReview() {
     abortRef.current?.abort();
+    abortFixRef.current?.abort();
+  }
+
+  async function runApplyFixes(findingIds: string[]) {
+    if (!bundle || !result || result.kind !== "structured") return;
+    const token = settings.githubToken.trim();
+    if (!token) {
+      setApplyError(
+        "Add a GitHub token with Contents write and Pull requests write.",
+      );
+      setSettingsOpen(true);
+      return;
+    }
+    const findings = result.findings.filter(
+      (finding) => findingIds.includes(finding.id) && finding.file,
+    );
+    const groups = groupFindingsByFile(findings);
+    if (groups.size === 0) {
+      setApplyError("Select findings that include a file path.");
+      return;
+    }
+    if (!resolvedTarget) {
+      setApplyError(
+        "No model is available. Connect LM Studio in Settings, or wait for hosted review.",
+      );
+      setSettingsOpen(true);
+      return;
+    }
+
+    let target = resolvedTarget;
+    let lmModels: string[] =
+      lmStatus.state === "online" ? lmStatus.models : [];
+    if (settings.provider === "lmstudio" && lmStatus.state !== "online") {
+      const status = await probeLmStudio(settings.lmStudioUrl);
+      setLmStatus(status);
+      if (status.state !== "online") {
+        setApplyError(status.reason);
+        setSettingsOpen(true);
+        return;
+      }
+      lmModels = status.models;
+      target = "lmstudio";
+      if (!settings.lmStudioModel && status.models[0]) {
+        updateSettings({ ...settings, lmStudioModel: status.models[0] });
+      }
+    }
+
+    const controller = new AbortController();
+    abortFixRef.current = controller;
+    setApplying(true);
+    setApplyError(null);
+    setApplyResult(null);
+    setPatchResult(null);
+    setVerifySummary(null);
+    setTab("review");
+
+    try {
+      const paths = [...groups.keys()];
+      const loaded = await ensureContents(paths, contents);
+      const changes = [];
+      let index = 0;
+      const model =
+        target === "lmstudio"
+          ? settings.lmStudioModel || lmModels[0] || ""
+          : "grok-4.5";
+
+      for (const [path, fileFindings] of groups) {
+        index += 1;
+        setApplyProgress(`Rewriting ${index}/${groups.size} · ${path}`);
+        const current = loaded[path];
+        if (!current?.trim()) {
+          throw new Error(`Could not load ${path} from GitHub.`);
+        }
+        const text = await completeChat({
+          target,
+          lmStudioUrl: settings.lmStudioUrl,
+          model,
+          messages: buildFixFileMessages({
+            owner: bundle.meta.owner,
+            repo: bundle.meta.repo,
+            path,
+            current,
+            findings: fileFindings,
+          }),
+          temperature: 0.1,
+          signal: controller.signal,
+          onDelta: () => {},
+        });
+        const parsed = parseFileChanges(text).filter((file) => file.path === path);
+        const next = parsed[0];
+        if (!next) {
+          throw new Error(`The model did not return a valid update for ${path}.`);
+        }
+        changes.push(next);
+      }
+
+      const jobHead = reviewJob?.head || bundle.meta.defaultBranch;
+      const jobBase = reviewJob?.base || bundle.meta.defaultBranch;
+      setApplyProgress(`Writing quarry/* from ${jobHead}`);
+      const pushed = await commitJobFixes({
+        owner: bundle.meta.owner,
+        repo: bundle.meta.repo,
+        token,
+        defaultBranch: bundle.meta.defaultBranch,
+        jobHead,
+        jobBase,
+        parentSha: reviewJob?.sha || bundle.headSha,
+        message: `fix: quarry review patches (${changes.length} files)`,
+        files: changes,
+        prTitle: reviewJob?.number
+          ? `Quarry: ${reviewJob.title}`
+          : `Quarry fixes for ${bundle.meta.owner}/${bundle.meta.repo}`,
+        prBody: [
+          `Job: ${reviewJob?.kind ?? "default"} \`${jobHead}\`. PR base \`${jobBase}\`. Default branch was not modified.`,
+          reviewJob?.kind === "issue" && reviewJob.number
+            ? `Closes #${reviewJob.number}`
+            : "",
+          "",
+          "Findings:",
+          ...findings.map(
+            (finding) => `- ${finding.title} (\`${finding.file}\`)`,
+          ),
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      });
+      if (!pushed.ok) {
+        setApplyError(pushed.error);
+        return;
+      }
+      setApplyResult(pushed.data);
+      const written = Object.fromEntries(changes.map((file) => [file.path, file.content]));
+      setApplyProgress("Re-reviewing the patch…");
+      try {
+        const patchText = await completeChat({
+          target,
+          lmStudioUrl: settings.lmStudioUrl,
+          model,
+          messages: buildPatchReviewMessages({
+            meta: bundle.meta,
+            lens,
+            paths: changes.map((file) => file.path),
+            contents: written,
+            maxChars: 16_000,
+          }),
+          temperature: 0.1,
+          signal: controller.signal,
+          onDelta: () => {},
+        });
+        setPatchResult(parseReview(patchText));
+      } catch {
+        setPatchResult(null);
+      }
+      if (pushed.data.prNumber) {
+        setApplyProgress("Checking GitHub status…");
+        const checks = await pollCommitChecks({
+          owner: bundle.meta.owner,
+          repo: bundle.meta.repo,
+          token,
+          sha: pushed.data.commitSha,
+          attempts: 3,
+          delayMs: 2000,
+        });
+        const section = formatVerifySection(checks);
+        setVerifySummary(section);
+        await appendPullBody({
+          owner: bundle.meta.owner,
+          repo: bundle.meta.repo,
+          token,
+          number: pushed.data.prNumber,
+          extra: section,
+        });
+      }
+      setApplyProgress(null);
+    } catch (err) {
+      if (controller.signal.aborted) {
+        setApplyError("Apply cancelled.");
+        return;
+      }
+      setApplyError(err instanceof Error ? err.message : "Apply failed.");
+    } finally {
+      setApplying(false);
+      if (abortFixRef.current === controller) abortFixRef.current = null;
+    }
   }
 
   function discardCheckpoint() {
@@ -604,18 +1072,48 @@ export function QuarryApp() {
 
   function reset() {
     abortRef.current?.abort();
+    abortFixRef.current?.abort();
     setBundle(null);
     setSelected([]);
     setContents({});
     setResult(null);
     setStreamText("");
     setQueueProgress(null);
+    setApplying(false);
+    setApplyProgress(null);
+    setApplyResult(null);
+    setApplyError(null);
+    setReviewJob(null);
+    setRepoContext("");
+    setPatchResult(null);
+    setVerifySummary(null);
     setError(null);
     setPhase("idle");
     setTab("overview");
   }
 
   const langs = bundle ? languageShare(bundle.languages) : [];
+  const reviewedIndex = lastReviewIndex(history);
+  const campaigns = groupCampaigns(history);
+  const currentPlaybook = bundle
+    ? playbooks[playbookKey(bundle.meta.owner, bundle.meta.repo)] ?? emptyPlaybook()
+    : emptyPlaybook();
+  let writeHint: string | undefined;
+  if (bundle && reviewJob) {
+    try {
+      const target = resolveFixWriteTarget({
+        defaultBranch: bundle.meta.defaultBranch,
+        jobHead: reviewJob.head,
+        jobBase: reviewJob.base,
+      });
+      writeHint =
+        target.mode === "update"
+          ? `Will commit on existing ${target.branch} (PR base ${target.prBase}). Never writes to ${bundle.meta.defaultBranch}.`
+          : `Will create ${target.branch} from ${reviewJob.head} and open a PR into ${target.prBase}. Never writes to ${bundle.meta.defaultBranch}.`;
+    } catch {
+      writeHint = undefined;
+    }
+  }
   const modelChip =
     lmStatus.state === "online"
       ? `LM Studio · ${settings.lmStudioModel || lmStatus.models[0] || "ready"}`
@@ -678,11 +1176,42 @@ export function QuarryApp() {
               setSource={setSource}
               loading={phase === "loading"}
               error={error}
+              checkpoint={checkpoint}
               onSubmit={() => void loadRepo(source)}
               onPick={(item) => void loadRepo(item)}
+              onResumeSaved={() => {
+                if (!checkpoint) return;
+                void loadRepo(`${checkpoint.owner}/${checkpoint.repo}`);
+              }}
+              onDiscardSaved={discardCheckpoint}
               lmStatus={lmStatus}
               grokAvailable={grokAvailable}
               onOpenSettings={() => setSettingsOpen(true)}
+              accessible={accessible}
+              onRefreshAccessible={() => setAccessibleTick((n) => n + 1)}
+              pins={pins}
+              onTogglePin={(name) => setPins((current) => toggleWatchlist(current, name))}
+              lastReviewed={reviewedIndex}
+              campaigns={campaigns}
+              defaultPlaybook={defaultPlaybook}
+              onDefaultPlaybook={(next) => {
+                setDefaultPlaybook(next);
+                saveDefaultPlaybook(next);
+              }}
+              tokenReady={Boolean(settings.githubToken.trim())}
+              modelReady={resolvedTarget !== null}
+              searching={searchingCode}
+              searchError={searchError}
+              searchNote={searchNote}
+              onSearchPin={(query) => void findAndPin(query)}
+              rollout={rollout}
+              rolloutBusy={rolloutBusy}
+              streamText={streamText}
+              queueProgress={queueProgress}
+              onStartRollout={() => void runRollout()}
+              onResumeRollout={() => void runRollout(rollout)}
+              onStopRollout={cancelReview}
+              onDismissRollout={dismissRollout}
             />
           ) : bundle ? (
             <Workspace
@@ -705,12 +1234,36 @@ export function QuarryApp() {
               onLoad={() => void loadRepo(source)}
               onReview={() => void runReview()}
               onCancel={cancelReview}
+              onDiscardSaved={discardCheckpoint}
+              checkpoint={checkpoint}
               onReset={reset}
               result={result}
               streamText={streamText}
               queueProgress={queueProgress}
               providerLabel={providerLabel}
               resolvedTarget={resolvedTarget}
+              applying={applying}
+              applyProgress={applyProgress}
+              applyResult={applyResult}
+              applyError={applyError}
+              hasGithubToken={Boolean(settings.githubToken.trim())}
+              onApplyFixes={runApplyFixes}
+              reviewJob={reviewJob}
+              jobLists={jobLists}
+              jobLoading={jobLoading}
+              onSelectJob={(item) => void selectJob(item)}
+              onDefaultJob={() => void selectJob({ kind: "default" })}
+              playbook={currentPlaybook}
+              onPlaybook={(next) =>
+                bundle &&
+                setPlaybooks((current) =>
+                  upsertPlaybook(current, bundle.meta.owner, bundle.meta.repo, next),
+                )
+              }
+              repoContext={repoContext}
+              writeHint={writeHint}
+              patchResult={patchResult}
+              verifySummary={verifySummary}
             />
           ) : null}
         </main>
@@ -730,6 +1283,10 @@ export function QuarryApp() {
         open={historyOpen}
         onOpenChange={setHistoryOpen}
         records={history}
+        watchlist={pins}
+        playbooks={playbooks}
+        defaultPlaybook={defaultPlaybook}
+        onImport={(records) => setHistory(records)}
         onOpen={(record) => {
           setHistoryOpen(false);
           setSource(`${record.owner}/${record.repo}`);
@@ -753,24 +1310,95 @@ function Landing({
   setSource,
   loading,
   error,
+  checkpoint,
   onSubmit,
   onPick,
+  onResumeSaved,
+  onDiscardSaved,
   lmStatus,
   grokAvailable,
   onOpenSettings,
+  accessible,
+  onRefreshAccessible,
+  pins,
+  onTogglePin,
+  lastReviewed,
+  campaigns,
+  defaultPlaybook,
+  onDefaultPlaybook,
+  tokenReady,
+  modelReady,
+  searching,
+  searchError,
+  searchNote,
+  onSearchPin,
+  rollout,
+  rolloutBusy,
+  streamText,
+  queueProgress,
+  onStartRollout,
+  onResumeRollout,
+  onStopRollout,
+  onDismissRollout,
 }: {
   source: string;
   setSource: (value: string) => void;
   loading: boolean;
   error: string | null;
+  checkpoint: QueueCheckpoint | null;
   onSubmit: () => void;
   onPick: (source: string) => void;
+  onResumeSaved: () => void;
+  onDiscardSaved: () => void;
   lmStatus: LmStatus;
   grokAvailable: boolean | null;
   onOpenSettings: () => void;
+  accessible: AccessibleReposState;
+  onRefreshAccessible: () => void;
+  pins: string[];
+  onTogglePin: (fullName: string) => void;
+  lastReviewed: ReturnType<typeof lastReviewIndex>;
+  campaigns: ReturnType<typeof groupCampaigns>;
+  defaultPlaybook: Playbook;
+  onDefaultPlaybook: (playbook: Playbook) => void;
+  tokenReady: boolean;
+  modelReady: boolean;
+  searching: boolean;
+  searchError: string | null;
+  searchNote: string | null;
+  onSearchPin: (query: string) => void;
+  rollout: RolloutJob | null;
+  rolloutBusy: boolean;
+  streamText: string;
+  queueProgress: ReviewQueueProgress | null;
+  onStartRollout: () => void;
+  onResumeRollout: () => void;
+  onStopRollout: () => void;
+  onDismissRollout: () => void;
 }) {
+  const savedCount = checkpoint ? completedBatchCount(checkpoint) : 0;
   return (
     <section className="mx-auto flex w-full max-w-2xl flex-1 flex-col justify-center pb-10">
+      {checkpoint && savedCount > 0 ? (
+        <div className="mb-8 rounded-2xl bg-card p-4 shadow-[var(--shadow-border)]">
+          <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+            Saved queue
+          </p>
+          <p className="mt-2 text-sm leading-relaxed">
+            {checkpoint.owner}/{checkpoint.repo} — {savedCount} of{" "}
+            {checkpoint.batches.length} batches kept after the tab closed or
+            Stop.
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button type="button" onClick={onResumeSaved}>
+              Continue
+            </Button>
+            <Button type="button" variant="ghost" onClick={onDiscardSaved}>
+              Discard
+            </Button>
+          </div>
+        </div>
+      ) : null}
       <p className="text-xs font-medium tracking-[0.18em] text-muted-foreground uppercase">
         {APP_TAGLINE}
       </p>
@@ -778,9 +1406,9 @@ function Landing({
         See the work as it actually is.
       </h1>
       <p className="mt-5 max-w-xl text-base leading-relaxed text-muted-foreground md:text-lg">
-        Paste a GitHub URL you can access. Quarry reads the source and writes a
-        structured review — using your LM Studio model, or Grok if no local
-        server is running. Private repos need a token in Settings.
+        Open a GitHub repository you can access — including private repos when a
+        token is in Settings. Quarry reads the source and writes a structured
+        review with your LM Studio model, or Grok if no local server is running.
       </p>
 
       <form
@@ -800,7 +1428,7 @@ function Landing({
           className="h-12 text-base"
           aria-label="GitHub repository"
         />
-        <Button type="submit" size="lg" disabled={loading} className="sm:min-w-28">
+        <Button type="submit" size="lg" disabled={loading || rolloutBusy} className="sm:min-w-28">
           {loading ? <Loader2 className="animate-spin" /> : null}
           Open
         </Button>
@@ -821,18 +1449,64 @@ function Landing({
         </p>
       ) : null}
 
-      <div className="mt-5 flex flex-wrap gap-2">
-        {SUGGESTED.map((item) => (
+      {accessible.status === "idle" ? (
+        <div className="mt-5 flex flex-wrap gap-2">
+          {SUGGESTED.map((item) => (
+            <button
+              key={item}
+              type="button"
+              onClick={() => onPick(item)}
+              className="h-10 rounded-full border border-border px-3.5 font-mono text-xs text-muted-foreground transition-colors duration-150 hover:bg-secondary hover:text-foreground"
+            >
+              {item}
+            </button>
+          ))}
+        </div>
+      ) : (
+        <AccessibleReposPanel
+          state={accessible}
+          onPick={onPick}
+          onRefresh={onRefreshAccessible}
+          onOpenSettings={onOpenSettings}
+          pins={pins}
+          onTogglePin={onTogglePin}
+          lastReviewed={lastReviewed}
+        />
+      )}
+      <RolloutPanel
+        playbook={defaultPlaybook}
+        onPlaybook={onDefaultPlaybook}
+        pinCount={pins.length}
+        tokenReady={tokenReady}
+        modelReady={modelReady}
+        searching={searching}
+        searchError={searchError}
+        searchNote={searchNote}
+        onSearchPin={onSearchPin}
+        rollout={rollout}
+        rolloutBusy={rolloutBusy}
+        streamText={streamText}
+        queueProgress={queueProgress}
+        onStart={onStartRollout}
+        onResume={onResumeRollout}
+        onStop={onStopRollout}
+        onDismiss={onDismissRollout}
+      />
+      <CampaignsPanel groups={campaigns} onOpen={(owner, repo) => onPick(`${owner}/${repo}`)} />
+
+      {accessible.status === "idle" ? (
+        <p className="mt-4 text-sm text-muted-foreground">
+          Add a GitHub token in{" "}
           <button
-            key={item}
             type="button"
-            onClick={() => onPick(item)}
-            className="h-10 rounded-full border border-border px-3.5 font-mono text-xs text-muted-foreground transition-colors duration-150 hover:bg-secondary hover:text-foreground"
+            className="underline underline-offset-2"
+            onClick={onOpenSettings}
           >
-            {item}
-          </button>
-        ))}
-      </div>
+            Settings
+          </button>{" "}
+          to list private repositories you can access.
+        </p>
+      ) : null}
 
       <div className="mt-10 flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
         {lmStatus.state === "online" ? (
@@ -877,12 +1551,31 @@ function Workspace({
   onLoad,
   onReview,
   onCancel,
+  onDiscardSaved,
+  checkpoint,
   onReset,
   result,
   streamText,
   queueProgress,
   providerLabel,
   resolvedTarget,
+  applying,
+  applyProgress,
+  applyResult,
+  applyError,
+  hasGithubToken,
+  onApplyFixes,
+  reviewJob,
+  jobLists,
+  jobLoading,
+  onSelectJob,
+  onDefaultJob,
+  playbook,
+  onPlaybook,
+  repoContext,
+  writeHint,
+  patchResult,
+  verifySummary,
 }: {
   bundle: RepoBundle;
   langs: { name: string; pct: number }[];
@@ -903,14 +1596,41 @@ function Workspace({
   onLoad: () => void;
   onReview: () => void;
   onCancel: () => void;
+  onDiscardSaved: () => void;
+  checkpoint: QueueCheckpoint | null;
   onReset: () => void;
   result: ReviewResult | null;
   streamText: string;
   queueProgress: ReviewQueueProgress | null;
   providerLabel: string;
   resolvedTarget: "lmstudio" | "grok" | null;
+  applying: boolean;
+  applyProgress: string | null;
+  applyResult: BranchPushResult | null;
+  applyError: string | null;
+  hasGithubToken: boolean;
+  onApplyFixes: (findingIds: string[]) => void;
+  reviewJob: ReviewJob | null;
+  jobLists: { pulls: JobListItem[]; branches: JobListItem[]; issues: JobListItem[] };
+  jobLoading: boolean;
+  onSelectJob: (item: JobListItem) => void;
+  onDefaultJob: () => void;
+  playbook: Playbook;
+  onPlaybook: (playbook: Playbook) => void;
+  repoContext: string;
+  writeHint?: string;
+  patchResult: ReviewResult | null;
+  verifySummary: string | null;
 }) {
   const { meta } = bundle;
+  const savedCount = checkpoint ? completedBatchCount(checkpoint) : 0;
+  const pendingCount = checkpoint ? pendingBatchIndexes(checkpoint).length : 0;
+  const canResume =
+    !reviewing &&
+    checkpoint &&
+    checkpointMatchesRepo(checkpoint, meta.owner, meta.repo) &&
+    savedCount > 0 &&
+    pendingCount > 0;
 
   return (
     <div className="flex flex-1 flex-col gap-6">
@@ -1047,13 +1767,27 @@ function Workspace({
             </Button>
           ) : (
             <Button type="button" onClick={onReview} disabled={loading}>
-              {resolvedTarget === "lmstudio" && selected.length > 6
-                ? `Review ${selected.length} files in queue`
-                : `Review ${selected.length} files`}
+              {canResume
+                ? `Resume queue (${savedCount}/${checkpoint?.batches.length ?? 0})`
+                : resolvedTarget === "lmstudio" && selected.length > 6
+                  ? `Review ${selected.length} files in queue`
+                  : `Review ${selected.length} files`}
             </Button>
           )}
         </div>
       </div>
+
+      {canResume ? (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-card px-4 py-3 shadow-[var(--shadow-border)]">
+          <p className="text-sm">
+            {savedCount} of {checkpoint.batches.length} batches are saved. Resume
+            runs two LM Studio jobs at a time.
+          </p>
+          <Button type="button" variant="ghost" onClick={onDiscardSaved}>
+            Discard saved
+          </Button>
+        </div>
+      ) : null}
 
       {error ? (
         <p className="rounded-xl bg-danger/10 px-4 py-3 text-sm text-danger">{error}</p>
@@ -1084,6 +1818,23 @@ function Workspace({
             />
           </div>
           <div className="space-y-4">
+            {reviewJob ? (
+              <JobPicker
+                job={reviewJob}
+                pulls={jobLists.pulls}
+                branches={jobLists.branches}
+                issues={jobLists.issues}
+                loading={jobLoading || loading}
+                onDefault={onDefaultJob}
+                onSelect={onSelectJob}
+              />
+            ) : null}
+            <PlaybookEditor playbook={playbook} onChange={onPlaybook} />
+            {repoContext ? (
+              <pre className="overflow-x-auto rounded-2xl bg-card p-5 font-mono text-xs leading-relaxed text-muted-foreground shadow-[var(--shadow-border)]">
+                {repoContext}
+              </pre>
+            ) : null}
             <div className="rounded-2xl bg-card p-5 shadow-[var(--shadow-border)]">
               <h2 className="font-display text-xl tracking-tight">What will be read</h2>
               <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
@@ -1128,6 +1879,16 @@ function Workspace({
             streamText={streamText}
             reviewing={reviewing}
             queueProgress={queueProgress}
+            defaultBranch={meta.defaultBranch}
+            applying={applying}
+            applyProgress={applyProgress}
+            applyResult={applyResult}
+            applyError={applyError}
+            hasGithubToken={hasGithubToken}
+            onApplyFixes={onApplyFixes}
+            writeHint={writeHint}
+            patchResult={patchResult}
+            verifySummary={verifySummary}
           />
         </TabsContent>
       </Tabs>
@@ -1139,13 +1900,39 @@ function HistorySheet({
   open,
   onOpenChange,
   records,
+  watchlist,
+  playbooks,
+  defaultPlaybook,
   onOpen,
+  onImport,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   records: ReviewRecord[];
+  watchlist: string[];
+  playbooks: Record<string, Playbook>;
+  defaultPlaybook: Playbook;
   onOpen: (record: ReviewRecord) => void;
+  onImport: (records: ReviewRecord[]) => void;
 }) {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  records: ReviewRecord[];
+  watchlist: string[];
+  playbooks: Record<string, Playbook>;
+  defaultPlaybook: Playbook;
+  onOpen: (record: ReviewRecord) => void;
+  onImport: (records: ReviewRecord[]) => void;
+}) {
+  function download(name: string, body: string, type: string) {
+    const blob = new Blob([body], { type });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = name;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="inset-y-0 right-0 left-auto flex h-dvh w-full max-w-md flex-col rounded-none border-y-0 border-r-0 p-0">
@@ -1153,10 +1940,68 @@ function HistorySheet({
           <div>
             <DialogTitle>History</DialogTitle>
             <DialogDescription className="mt-1">
-              Reviews stay on this device.
+              Reviews stay on this device until you export a dump for Railway.
             </DialogDescription>
           </div>
           <DialogClose />
+        </div>
+        <div className="safe-px flex flex-wrap gap-2 pb-3">
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            onClick={() => download("quarry-history.json", exportHistoryJson(records), "application/json")}
+          >
+            Export JSON
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            onClick={() =>
+              download(
+                "quarry-dump.json",
+                exportOperatorDumpJson(
+                  buildOperatorDump({
+                    history: records,
+                    watchlist,
+                    playbooks,
+                    defaultPlaybook,
+                  }),
+                ),
+                "application/json",
+              )
+            }
+          >
+            Export dump
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            onClick={() =>
+              download("quarry-history.md", exportHistoryMarkdown(records), "text/markdown")
+            }
+          >
+            Export markdown
+          </Button>
+          <label className="inline-flex h-8 cursor-pointer items-center text-sm underline underline-offset-2">
+            Import JSON
+            <input
+              type="file"
+              accept="application/json"
+              className="sr-only"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (!file) return;
+                void file.text().then((text) => {
+                  const next = parseHistoryImport(text);
+                  saveHistory(next);
+                  onImport(next);
+                });
+              }}
+            />
+          </label>
         </div>
         <div className="safe-px safe-pb flex-1 overflow-y-auto scroll-thin pb-10">
           {records.length === 0 ? (

@@ -34,6 +34,8 @@ export type RepoBundle = {
   contents: Record<string, string>;
   treeTruncated: boolean;
   listedTruncated: boolean;
+  headSha: string;
+  headRef: string;
 };
 
 export type GithubErrorCode =

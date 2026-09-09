@@ -1,5 +1,6 @@
 import type { FileEntry } from "./types";
 import type { ReviewLens } from "@/lib/review/types";
+import { pathMatchesAny, type Playbook } from "../playbook";
 
 const SKIP_DIR =
   /(^|\/)(node_modules|dist|build|vendor|coverage|\.git|\.next|\.nuxt|\.output|out|target|__pycache__|\.venv|venv|\.turbo|storybook-static|Pods)(\/|$)/i;
@@ -93,14 +94,36 @@ export function pickSmartFiles(
   lens: ReviewLens,
   maxFiles: number,
   maxChars: number,
+  options?: { extraPaths?: string[]; playbook?: Playbook | null },
 ): string[] {
-  const ranked = listReviewableFiles(files)
+  const playbook = options?.playbook;
+  const reviewable = listReviewableFiles(files).filter(
+    (file) => !playbook?.ignore.length || !pathMatchesAny(file.path, playbook.ignore),
+  );
+  const ranked = reviewable
     .map((file) => ({ file, score: scoreFile(file.path, lens) }))
     .sort((a, b) => b.score - a.score || a.file.size - b.file.size);
 
+  const known = new Set(reviewable.map((file) => file.path));
+  const forced = [
+    ...(options?.extraPaths ?? []),
+    ...(playbook?.include.length
+      ? reviewable
+          .filter((file) => pathMatchesAny(file.path, playbook.include))
+          .map((file) => file.path)
+      : []),
+  ].filter((path) => known.has(path));
+
   const selected: string[] = [];
   let used = 0;
+  for (const path of [...new Set(forced)]) {
+    if (selected.length >= Math.max(maxFiles, forced.length)) break;
+    const file = reviewable.find((item) => item.path === path);
+    selected.push(path);
+    used += file?.size ?? 0;
+  }
   for (const item of ranked) {
+    if (selected.includes(item.file.path)) continue;
     if (selected.length >= maxFiles) break;
     if (used + item.file.size > maxChars && selected.length >= 4) break;
     selected.push(item.file.path);

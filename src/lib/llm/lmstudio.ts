@@ -11,8 +11,19 @@ export async function probeLmStudio(baseUrl: string): Promise<LmProbeResult> {
     const res = await fetch(`/api/lm?baseUrl=${encodeURIComponent(baseUrl)}`, {
       signal: AbortSignal.timeout(4000),
     });
-    const json = (await res.json()) as LmProbeResult & { error?: string };
-    if (json.state === "online" || json.state === "offline") return json;
+    const json = (await res.json()) as {
+      state?: string;
+      models?: string[];
+      url?: string;
+      reason?: string;
+      error?: string;
+    };
+    if (json.state === "online") {
+      return { state: "online", models: json.models ?? [], url: json.url ?? baseUrl };
+    }
+    if (json.state === "offline") {
+      return { state: "offline", reason: json.reason || json.error || "LM Studio probe failed.", url: json.url };
+    }
     return {
       state: "offline",
       reason: json.error || "LM Studio probe failed.",
