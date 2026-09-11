@@ -34,15 +34,28 @@ import { QuarryMark } from "@/components/quarry/mark";
 import { Report } from "@/components/quarry/report";
 import { SettingsSheet } from "@/components/quarry/settings-sheet";
 import { JobPicker } from "@/components/quarry/job-picker";
+import { IssuesPanel } from "@/components/quarry/issues-panel";
 import { PlaybookEditor } from "@/components/quarry/playbook-editor";
 import { CampaignsPanel } from "@/components/quarry/campaigns-panel";
 import { RolloutPanel } from "@/components/quarry/rollout-panel";
+import {
+  OnboardPanel,
+  type OnboardFormValues,
+} from "@/components/quarry/onboard-panel";
 import {
   AccessibleReposPanel,
   type AccessibleReposState,
 } from "@/components/quarry/accessible-repos";
 import { fetchFileContents, loadBundleAtRef, openRepo } from "@/lib/github/api";
 import { listAccessibleRepos } from "@/lib/github/repos";
+import { onboardGithubRepo, onboardPlaybook } from "@/lib/github/onboard";
+import {
+  addressGithubIssue,
+  commentOnGithubIssue,
+  createGithubIssue,
+  createIssuesFromFindings,
+  resolveGithubIssue,
+} from "@/lib/github/issues";
 import { searchCodeRepos } from "@/lib/github/search";
 import {
   defaultReviewJob,
@@ -191,6 +204,13 @@ export function QuarryApp() {
   const [searchingCode, setSearchingCode] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [searchNote, setSearchNote] = useState<string | null>(null);
+  const [onboardBusy, setOnboardBusy] = useState(false);
+  const [onboardError, setOnboardError] = useState<string | null>(null);
+  const [jobsTick, setJobsTick] = useState(0);
+  const [issueBusy, setIssueBusy] = useState(false);
+  const [issueError, setIssueError] = useState<string | null>(null);
+  const [issueNote, setIssueNote] = useState<string | null>(null);
+  const [filingIssues, setFilingIssues] = useState(false);
   const [reviewJob, setReviewJob] = useState<ReviewJob | null>(null);
   const [jobLists, setJobLists] = useState<{
     pulls: JobListItem[];
@@ -297,7 +317,7 @@ export function QuarryApp() {
         if (err instanceof Error && err.name === "AbortError") return;
       });
     return () => controller.abort();
-  }, [bundle, settings.githubToken]);
+  }, [bundle, settings.githubToken, jobsTick]);
 
   function updateSettings(next: Settings) {
     setSettings(next);
@@ -313,7 +333,11 @@ export function QuarryApp() {
     return null;
   }, [settings.provider, lmStatus, grokAvailable]);
 
-  async function loadRepo(raw: string, keepResult?: ReviewResult) {
+  async function loadRepo(
+    raw: string,
+    keepResult?: ReviewResult,
+    playbookOverride?: Playbook,
+  ) {
     const identity = parseRepoInput(raw);
     if (!identity) {
       setError("Use owner/repo or a full GitHub URL.");
@@ -334,10 +358,12 @@ export function QuarryApp() {
     setSource(`${identity.owner}/${identity.repo}`);
     try {
       const playbook = resolvePlaybook(
-        playbooks[playbookKey(identity.owner, identity.repo)],
+        playbookOverride ??
+          playbooks[playbookKey(identity.owner, identity.repo)],
         defaultPlaybook,
       );
       const reviewLens = playbook.lens ?? lens;
+      if (playbookOverride?.lens) setLens(playbookOverride.lens);
       const res = await openRepo({
         source: raw,
         token: settings.githubToken || undefined,
@@ -550,6 +576,112 @@ export function QuarryApp() {
     }
   }
 
+  async function withIssueToken() {
+    const token = settings.githubToken.trim();
+    if (!bundle) return null;
+    if (!token) {
+      setIssueError("Add a GitHub token with Issues write in Settings.");
+      setSettingsOpen(true);
+      return null;
+    }
+    return { token, owner: bundle.meta.owner, repo: bundle.meta.repo };
+  }
+
+  async function createWorkspaceIssue(title: string, body: string) {
+    const ctx = await withIssueToken();
+    if (!ctx) return;
+    setIssueBusy(true);
+    setIssueError(null);
+    setIssueNote(null);
+    try {
+      const res = await createGithubIssue({ ...ctx, title, body });
+      if (!res.ok) {
+        setIssueError(res.error);
+        return;
+      }
+      setIssueNote(`Opened #${res.data.number}: ${res.data.title}`);
+      setJobsTick((n) => n + 1);
+    } finally {
+      setIssueBusy(false);
+    }
+  }
+
+  async function addressWorkspaceIssue(item: JobListItem, extra: string) {
+    const ctx = await withIssueToken();
+    if (!ctx || !item.number) return;
+    setIssueBusy(true);
+    setIssueError(null);
+    setIssueNote(null);
+    try {
+      const res = await addressGithubIssue({
+        ...ctx,
+        number: item.number,
+        extra,
+      });
+      if (!res.ok) {
+        setIssueError(res.error);
+        return;
+      }
+      setIssueNote(`Commented on #${item.number}.`);
+      await selectJob(item);
+    } finally {
+      setIssueBusy(false);
+    }
+  }
+
+  async function resolveWorkspaceIssue(item: JobListItem, extra: string) {
+    const ctx = await withIssueToken();
+    if (!ctx || !item.number) return;
+    setIssueBusy(true);
+    setIssueError(null);
+    setIssueNote(null);
+    try {
+      const res = await resolveGithubIssue({
+        ...ctx,
+        number: item.number,
+        extra,
+      });
+      if (!res.ok) {
+        setIssueError(res.error);
+        return;
+      }
+      setIssueNote(`Closed #${item.number}.`);
+      setJobsTick((n) => n + 1);
+      if (reviewJob?.kind === "issue" && reviewJob.number === item.number) {
+        await selectJob({ kind: "default" });
+      }
+    } finally {
+      setIssueBusy(false);
+    }
+  }
+
+  async function fileReviewFindings() {
+    const ctx = await withIssueToken();
+    if (!ctx || !result || result.kind !== "structured") return;
+    setFilingIssues(true);
+    setIssueError(null);
+    setIssueNote(null);
+    try {
+      const res = await createIssuesFromFindings({
+        ...ctx,
+        findings: result.findings,
+      });
+      if (!res.ok) {
+        setIssueError(res.error);
+        setIssueNote(res.error);
+        return;
+      }
+      const extra = res.data.warnings.length
+        ? ` ${res.data.warnings.length} skipped.`
+        : "";
+      const note = `Opened ${res.data.issues.map((item) => `#${item.number}`).join(", ")}.${extra}`;
+      setIssueNote(note);
+      setJobsTick((n) => n + 1);
+    } finally {
+      setFilingIssues(false);
+    }
+  }
+
   async function resolveModelTarget(): Promise<{
     target: "lmstudio" | "grok";
     model: string;
@@ -683,6 +815,47 @@ export function QuarryApp() {
       setError(err instanceof Error ? err.message : "Review failed.");
       setQueueProgress(null);
       setPhase("ready");
+    }
+  }
+
+  async function createWorkspace(values: OnboardFormValues) {
+    const token = settings.githubToken.trim();
+    if (!token) {
+      setOnboardError("Add a GitHub token in Settings to create repositories.");
+      return;
+    }
+    setOnboardBusy(true);
+    setOnboardError(null);
+    try {
+      const res = await onboardGithubRepo({
+        token,
+        kind: values.kind,
+        title: values.title,
+        name: values.name,
+        owner: values.owner,
+        brief: values.brief,
+        private: values.private,
+      });
+      if (!res.ok) {
+        setOnboardError(res.error);
+        return;
+      }
+      const playbook = onboardPlaybook();
+      setPlaybooks((current) =>
+        upsertPlaybook(current, res.data.repo.owner, res.data.repo.repo, playbook),
+      );
+      setPins((current) => addWatchlistPins(current, [res.data.repo.fullName]));
+      setAccessibleTick((n) => n + 1);
+      if (res.data.warnings.length) {
+        setOnboardError(res.data.warnings.join(" "));
+      }
+      await loadRepo(res.data.repo.fullName, undefined, playbook);
+    } catch (err) {
+      setOnboardError(
+        err instanceof Error ? err.message : "Could not create that workspace.",
+      );
+    } finally {
+      setOnboardBusy(false);
     }
   }
 
@@ -1050,6 +1223,30 @@ export function QuarryApp() {
           extra: section,
         });
       }
+      if (
+        reviewJob?.kind === "issue" &&
+        reviewJob.number &&
+        (pushed.data.prUrl || pushed.data.commitSha)
+      ) {
+        try {
+          await commentOnGithubIssue({
+            owner: bundle.meta.owner,
+            repo: bundle.meta.repo,
+            token,
+            number: reviewJob.number,
+            body: [
+              "Quarry opened a fix for this issue.",
+              pushed.data.prUrl ? `Pull request: ${pushed.data.prUrl}` : "",
+              `Commit: \`${pushed.data.commitSha.slice(0, 8)}\` on \`${pushed.data.branch}\`.`,
+              "Close this issue after the PR merges, or Resolve it from Quarry.",
+            ]
+              .filter(Boolean)
+              .join("\n"),
+          });
+        } catch {
+          // The PR already landed; a missing issue comment is not a failed apply.
+        }
+      }
       setApplyProgress(null);
     } catch (err) {
       if (controller.signal.aborted) {
@@ -1087,6 +1284,8 @@ export function QuarryApp() {
     setRepoContext("");
     setPatchResult(null);
     setVerifySummary(null);
+    setIssueError(null);
+    setIssueNote(null);
     setError(null);
     setPhase("idle");
     setTab("overview");
@@ -1204,6 +1403,10 @@ export function QuarryApp() {
               searchError={searchError}
               searchNote={searchNote}
               onSearchPin={(query) => void findAndPin(query)}
+              onCreateWorkspace={(values) => void createWorkspace(values)}
+              onboardBusy={onboardBusy}
+              onboardError={onboardError}
+              githubToken={settings.githubToken}
               rollout={rollout}
               rolloutBusy={rolloutBusy}
               streamText={streamText}
@@ -1253,6 +1456,14 @@ export function QuarryApp() {
               jobLoading={jobLoading}
               onSelectJob={(item) => void selectJob(item)}
               onDefaultJob={() => void selectJob({ kind: "default" })}
+              issueBusy={issueBusy}
+              issueError={issueError}
+              issueNote={issueNote}
+              onCreateIssue={(title, body) => void createWorkspaceIssue(title, body)}
+              onAddressIssue={(item, extra) => void addressWorkspaceIssue(item, extra)}
+              onResolveIssue={(item, extra) => void resolveWorkspaceIssue(item, extra)}
+              filingIssues={filingIssues}
+              onFileFindings={() => void fileReviewFindings()}
               playbook={currentPlaybook}
               onPlaybook={(next) =>
                 bundle &&
@@ -1332,6 +1543,10 @@ function Landing({
   searchError,
   searchNote,
   onSearchPin,
+  onCreateWorkspace,
+  onboardBusy,
+  onboardError,
+  githubToken,
   rollout,
   rolloutBusy,
   streamText,
@@ -1367,6 +1582,10 @@ function Landing({
   searchError: string | null;
   searchNote: string | null;
   onSearchPin: (query: string) => void;
+  onCreateWorkspace: (values: OnboardFormValues) => void;
+  onboardBusy: boolean;
+  onboardError: string | null;
+  githubToken: string;
   rollout: RolloutJob | null;
   rolloutBusy: boolean;
   streamText: string;
@@ -1407,8 +1626,9 @@ function Landing({
       </h1>
       <p className="mt-5 max-w-xl text-base leading-relaxed text-muted-foreground md:text-lg">
         Open a GitHub repository you can access — including private repos when a
-        token is in Settings. Quarry reads the source and writes a structured
-        review with your LM Studio model, or Grok if no local server is running.
+        token is in Settings. Create a client or idea workspace from that same
+        token, then review the tree with your LM Studio model, or Grok if no
+        local server is running.
       </p>
 
       <form
@@ -1473,6 +1693,17 @@ function Landing({
           lastReviewed={lastReviewed}
         />
       )}
+      <OnboardPanel
+        tokenReady={tokenReady}
+        token={githubToken}
+        defaultOwner={
+          accessible.status === "ready" ? accessible.login : null
+        }
+        busy={onboardBusy}
+        error={onboardError}
+        onCreate={onCreateWorkspace}
+        onOpenSettings={onOpenSettings}
+      />
       <RolloutPanel
         playbook={defaultPlaybook}
         onPlaybook={onDefaultPlaybook}
@@ -1570,6 +1801,14 @@ function Workspace({
   jobLoading,
   onSelectJob,
   onDefaultJob,
+  issueBusy,
+  issueError,
+  issueNote,
+  onCreateIssue,
+  onAddressIssue,
+  onResolveIssue,
+  filingIssues,
+  onFileFindings,
   playbook,
   onPlaybook,
   repoContext,
@@ -1615,6 +1854,14 @@ function Workspace({
   jobLoading: boolean;
   onSelectJob: (item: JobListItem) => void;
   onDefaultJob: () => void;
+  issueBusy: boolean;
+  issueError: string | null;
+  issueNote: string | null;
+  onCreateIssue: (title: string, body: string) => void;
+  onAddressIssue: (item: JobListItem, extra: string) => void;
+  onResolveIssue: (item: JobListItem, extra: string) => void;
+  filingIssues: boolean;
+  onFileFindings: () => void;
   playbook: Playbook;
   onPlaybook: (playbook: Playbook) => void;
   repoContext: string;
@@ -1829,6 +2076,20 @@ function Workspace({
                 onSelect={onSelectJob}
               />
             ) : null}
+            {reviewJob ? (
+              <IssuesPanel
+                job={reviewJob}
+                issues={jobLists.issues}
+                hasToken={hasGithubToken}
+                busy={issueBusy}
+                error={issueError}
+                note={issueNote}
+                onSelect={onSelectJob}
+                onCreate={onCreateIssue}
+                onAddress={onAddressIssue}
+                onResolve={onResolveIssue}
+              />
+            ) : null}
             <PlaybookEditor playbook={playbook} onChange={onPlaybook} />
             {repoContext ? (
               <pre className="overflow-x-auto rounded-2xl bg-card p-5 font-mono text-xs leading-relaxed text-muted-foreground shadow-[var(--shadow-border)]">
@@ -1886,6 +2147,9 @@ function Workspace({
             applyError={applyError}
             hasGithubToken={hasGithubToken}
             onApplyFixes={onApplyFixes}
+            filingIssues={filingIssues}
+            fileIssuesNote={issueNote}
+            onFileFindings={onFileFindings}
             writeHint={writeHint}
             patchResult={patchResult}
             verifySummary={verifySummary}

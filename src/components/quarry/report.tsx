@@ -72,6 +72,9 @@ export function Report({
   applyError,
   hasGithubToken,
   onApplyFixes,
+  filingIssues,
+  fileIssuesNote,
+  onFileFindings,
   writeHint,
   patchResult,
   verifySummary,
@@ -94,6 +97,9 @@ export function Report({
   applyError?: string | null;
   hasGithubToken?: boolean;
   onApplyFixes?: (findingIds: string[]) => void;
+  filingIssues?: boolean;
+  fileIssuesNote?: string | null;
+  onFileFindings?: () => void;
   writeHint?: string;
   patchResult?: ReviewResult | null;
   verifySummary?: string | null;
@@ -227,6 +233,30 @@ export function Report({
           writeHint={writeHint}
           onApply={onApplyFixes}
         />
+      ) : null}
+
+      {onFileFindings && result.kind === "structured" ? (
+        <div className="rounded-2xl bg-card p-5 shadow-[var(--shadow-border)]">
+          <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+            File as GitHub issues
+          </p>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Opens up to eight non-info findings as labeled issues on this
+            repository.
+          </p>
+          <Button
+            type="button"
+            className="mt-3"
+            variant="secondary"
+            disabled={!hasGithubToken || Boolean(filingIssues)}
+            onClick={onFileFindings}
+          >
+            {filingIssues ? "Filing…" : "Open findings as issues"}
+          </Button>
+          {fileIssuesNote ? (
+            <p className="mt-3 text-sm text-muted-foreground">{fileIssuesNote}</p>
+          ) : null}
+        </div>
       ) : null}
 
       {verifySummary ? (

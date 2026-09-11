@@ -31,14 +31,16 @@ Until LM Studio connects, reviews use **Grok** if `XAI_API_KEY` is set.
 
 Public repos work without a token, but GitHub rate-limits that tightly. A personal access token in Settings lists **every repository that token can see**, including private ones, and is required to open them:
 
-- Fine-grained: **Metadata: Read**, **Contents: Read and Write**, **Pull requests: Write** on the repositories you review
-- Classic: `repo` scope
+- Fine-grained: **Metadata: Read**, **Contents: Read and Write**, **Issues: Write**, **Pull requests: Write** on the repositories you review
+- Classic: `repo` scope (this is also what can **create** new repositories)
 
 The token stays in this browser. Without it, GitHub returns 404 for private repos.
 
-After a structured review, Quarry can ask the model for updated file text and push it to a `quarry/*` branch (update an existing quarry head, or nest `quarry/fix-…` from a PR/branch tip), then open or update a pull request. The default branch is never updated. GitHub check-runs are appended to the PR when the token can read them.
+**New workspace** on Overview creates a private (by default) repo for a client engagement or an idea, seeds README / brief / issue templates, opens intake issues, pins it, and opens it with the onboarding lens. Fine-grained tokens often cannot create repositories — use a classic `repo` token for that step. The seed commit is the only time Quarry writes the default branch.
 
-On Overview you can review the default branch, an open PR, another branch, or an issue. History can be exported as JSON or markdown.
+After a structured review, Quarry can ask the model for updated file text and push it to a `quarry/*` branch (update an existing quarry head, or nest `quarry/fix-…` from a PR/branch tip), then open or update a pull request. Later fixes never update the default branch. GitHub check-runs are appended to the PR when the token can read them.
+
+On Overview you can review the default branch, an open PR, another branch, or an issue. From the same screen you can **open**, **address** (comment), and **resolve** (close) GitHub issues. After a review, **Open findings as issues** files the non-info findings. History can be exported as JSON or markdown.
 
 ### Watchlist rollout
 

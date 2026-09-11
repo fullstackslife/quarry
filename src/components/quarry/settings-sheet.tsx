@@ -202,16 +202,18 @@ export function SettingsSheet({
               onChange={(e) =>
                 onChange({ ...settings, githubToken: e.target.value })
               }
-              placeholder="ghp_…  Contents + Pull requests"
+              placeholder="ghp_…  repo (list, write, create)"
               autoComplete="off"
             />
             <p className="text-sm text-muted-foreground">
-              Needed for listing the private repos you can access, a higher
-              public rate limit, and applying fixes on a new{" "}
-              <code>quarry/*</code> branch. Fine-grained: Metadata read, Contents
-              read and write, plus Pull requests write, on those repositories.
-              Classic: the repo scope. Stays on this device. Quarry never
-              commits to the default branch.
+              Needed for listing private repos, creating client or idea
+              workspaces, a higher public rate limit, and applying fixes on a{" "}
+              <code>quarry/*</code> branch. Fine-grained: Metadata read,
+              Contents read and write, Issues write, plus Pull requests write.
+              Classic: the <code>repo</code> scope (this is what can create new
+              repositories). Stays on this device. Fixes never land on the
+              default branch; a workspace you create here is seeded once on{" "}
+              <code>main</code>.
             </p>
           </section>
 
