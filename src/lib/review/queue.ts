@@ -3,7 +3,53 @@ import type { Finding, FindingSeverity, ReviewResult, StructuredReview } from ".
 export const BATCH_MAX_FILES = 6;
 export const BATCH_MAX_CHARS = 16_000;
 export const FILE_MAX_CHARS = 6_000;
-export const LM_STUDIO_CONCURRENCY = 2;
+/** Hard cap — matches LM Studio Parallel 4 on a single loaded coder. */
+export const LM_STUDIO_MAX_CONCURRENCY = 4;
+/** Fill the Parallel 4 slots. Drop to 1–2 if another model is also in RAM. */
+export const LM_STUDIO_DEFAULT_CONCURRENCY = 4;
+export const LM_STUDIO_CONCURRENCY_CHOICES = [1, 2, 4] as const;
+
+export function clampLmStudioConcurrency(value: unknown): number {
+  const n = Math.floor(Number(value));
+  if (!Number.isFinite(n)) return LM_STUDIO_DEFAULT_CONCURRENCY;
+  return Math.min(LM_STUDIO_MAX_CONCURRENCY, Math.max(1, n));
+}
+
+export type SlotLimiter = {
+  run<T>(work: () => Promise<T>): Promise<T>;
+};
+
+/** Global in-flight cap so file batches and catalog repos share the same 4 pings. */
+export function createSlotLimiter(limit: number): SlotLimiter {
+  const cap = Math.max(1, Math.min(LM_STUDIO_MAX_CONCURRENCY, Math.floor(limit) || 1));
+  let active = 0;
+  const waiters: Array<() => void> = [];
+
+  async function acquire() {
+    while (active >= cap) {
+      await new Promise<void>((resolve) => {
+        waiters.push(resolve);
+      });
+    }
+    active += 1;
+  }
+
+  function release() {
+    active -= 1;
+    waiters.shift()?.();
+  }
+
+  return {
+    async run<T>(work: () => Promise<T>): Promise<T> {
+      await acquire();
+      try {
+        return await work();
+      } finally {
+        release();
+      }
+    },
+  };
+}
 
 const SEVERITY_RANK: Record<FindingSeverity, number> = {
   critical: 4,

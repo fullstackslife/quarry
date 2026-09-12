@@ -36,6 +36,9 @@ function mapStatus(
   message?: string,
   token?: string,
 ) {
+  if (status === 409 || /repository is empty/i.test(message || "")) {
+    return fail(message || "Git Repository is empty.", "invalid");
+  }
   if (status === 404) {
     return fail(
       token
@@ -157,7 +160,7 @@ async function loadContents(
 ): Promise<Record<string, string>> {
     const unique = [...new Set(paths)].slice(0, 2000);
     const refQuery = ref ? `?ref=${encodeURIComponent(ref)}` : "";
-    const pairs = await mapPool(unique, 10, async (path) => {
+    const pairs = await mapPool(unique, 2, async (path) => {
     const encoded = path
       .split("/")
       .map((part) => encodeURIComponent(part))
@@ -248,16 +251,14 @@ export async function openRepo(input: {
       private: Boolean(repo.private),
     };
 
-    const [langRes, treeRes] = await Promise.all([
-      gh<Record<string, number>>(
-        `/repos/${meta.owner}/${meta.repo}/languages`,
-        token,
-      ),
-      gh<GhTree>(
-        `/repos/${meta.owner}/${meta.repo}/git/trees/${encodeURIComponent(meta.defaultBranch)}?recursive=1`,
-        token,
-      ),
-    ]);
+    const langRes = await gh<Record<string, number>>(
+      `/repos/${meta.owner}/${meta.repo}/languages`,
+      token,
+    );
+    const treeRes = await gh<GhTree>(
+      `/repos/${meta.owner}/${meta.repo}/git/trees/${encodeURIComponent(meta.defaultBranch)}?recursive=1`,
+      token,
+    );
 
     if (treeRes.status >= 400) {
       return mapStatus(

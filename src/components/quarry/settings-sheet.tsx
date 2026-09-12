@@ -13,7 +13,9 @@ import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import type { LmStatus } from "@/lib/llm/lmstudio";
 import { probeLmStudio } from "@/lib/llm/lmstudio";
+import { pickReviewModel } from "@/lib/llm/lmstudio-url";
 import type { ProviderId, Settings } from "@/lib/settings";
+import { LM_STUDIO_CONCURRENCY_CHOICES, LM_STUDIO_MAX_CONCURRENCY } from "@/lib/review/queue";
 import { cn } from "@/lib/utils";
 
 const PROVIDERS: { id: ProviderId; label: string }[] = [
@@ -21,6 +23,13 @@ const PROVIDERS: { id: ProviderId; label: string }[] = [
   { id: "lmstudio", label: "LM Studio" },
   { id: "grok", label: "Grok" },
 ];
+
+function adoptLoadedModel(settings: Settings, status: LmStatus): Settings | null {
+  if (status.state !== "online") return null;
+  const picked = pickReviewModel(status.loaded, status.models, settings.lmStudioModel);
+  if (!picked || picked === settings.lmStudioModel) return null;
+  return { ...settings, lmStudioModel: picked };
+}
 
 export function SettingsSheet({
   open,
@@ -47,9 +56,8 @@ export function SettingsSheet({
     void probeLmStudio(settings.lmStudioUrl).then((status) => {
       if (cancelled) return;
       onLmStatus(status);
-      if (status.state === "online" && !settings.lmStudioModel && status.models[0]) {
-        onChange({ ...settings, lmStudioModel: status.models[0] });
-      }
+      const adopted = adoptLoadedModel(settings, status);
+      if (adopted) onChange(adopted);
     });
     return () => {
       cancelled = true;
@@ -62,9 +70,8 @@ export function SettingsSheet({
     setTesting(true);
     const status = await probeLmStudio(settings.lmStudioUrl);
     onLmStatus(status);
-    if (status.state === "online" && !settings.lmStudioModel && status.models[0]) {
-      onChange({ ...settings, lmStudioModel: status.models[0] });
-    }
+    const adopted = adoptLoadedModel(settings, status);
+    if (adopted) onChange(adopted);
     setTesting(false);
   }
 
@@ -149,6 +156,7 @@ export function SettingsSheet({
                   {lmStatus.models.map((model) => (
                     <option key={model} value={model}>
                       {model}
+                      {lmStatus.loaded.includes(model) ? " (loaded)" : ""}
                     </option>
                   ))}
                 </select>
@@ -174,6 +182,12 @@ export function SettingsSheet({
               {testing ? <Loader2 className="animate-spin" /> : null}
               Test connection
             </Button>
+            {lmStatus.state === "online" && lmStatus.loaded.length ? (
+              <p className="text-sm text-muted-foreground">
+                In RAM: {lmStatus.loaded.join(", ")}. Quarry prefers a loaded
+                coder (then Qwen 3.5) so reviews use what is actually open.
+              </p>
+            ) : null}
             {lmStatus.state === "offline" ? (
               <p className="text-sm text-muted-foreground">{lmStatus.reason}</p>
             ) : null}
@@ -252,6 +266,31 @@ export function SettingsSheet({
                   })
                 }
               />
+            </div>
+            <div className="col-span-2 space-y-2">
+              <Label>In-flight completions</Label>
+              <div className="flex gap-2">
+                {LM_STUDIO_CONCURRENCY_CHOICES.map((n) => (
+                    <Button
+                      key={n}
+                      type="button"
+                      size="sm"
+                      variant={
+                        settings.lmStudioConcurrency === n ? "secondary" : "ghost"
+                      }
+                      onClick={() =>
+                        onChange({ ...settings, lmStudioConcurrency: n })
+                      }
+                    >
+                      {n}
+                    </Button>
+                ))}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Hard cap {LM_STUDIO_MAX_CONCURRENCY}, matching LM Studio Parallel
+                4. File batches and catalog repos share those slots — never more
+                than four pings at once. Use 1 if another model is still loaded.
+              </p>
             </div>
             <div className="col-span-2 space-y-2">
               <Label htmlFor="temp">Temperature ({settings.temperature})</Label>

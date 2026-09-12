@@ -2,7 +2,7 @@ import { githubRequest } from "./client.ts";
 import type { GithubErrorCode, GithubResult } from "./types.ts";
 
 export const ACCESSIBLE_REPO_PAGE_SIZE = 100;
-export const ACCESSIBLE_REPO_MAX_PAGES = 5;
+export const ACCESSIBLE_REPO_MAX_PAGES = 30;
 
 export type AccessibleRepo = {
   owner: string;
@@ -13,6 +13,8 @@ export type AccessibleRepo = {
   language: string | null;
   pushedAt: string | null;
   htmlUrl: string;
+  fork: boolean;
+  archived: boolean;
 };
 
 export type AccessibleRepoList = {
@@ -31,6 +33,8 @@ type GhRepoRow = {
   pushed_at?: string | null;
   html_url?: string;
   private?: boolean;
+  fork?: boolean;
+  archived?: boolean;
   owner?: { login?: string };
   message?: string;
 };
@@ -52,6 +56,8 @@ export function mapAccessibleRepo(row: GhRepoRow): AccessibleRepo | null {
     language: row.language ?? null,
     pushedAt: row.pushed_at ?? null,
     htmlUrl: row.html_url || `https://github.com/${owner}/${repo}`,
+    fork: Boolean(row.fork),
+    archived: Boolean(row.archived),
   };
 }
 

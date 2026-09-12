@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   BATCH_MAX_FILES,
+  clampLmStudioConcurrency,
+  createSlotLimiter,
+  LM_STUDIO_DEFAULT_CONCURRENCY,
+  LM_STUDIO_MAX_CONCURRENCY,
   mergeReviewResults,
   queueReviewBatches,
   runConcurrentIndexes,
@@ -80,6 +84,33 @@ test("mergeReviewResults keeps the higher severity duplicate", () => {
   assert.equal(merged.findings[0]?.severity, "high");
   assert.equal(merged.stack.includes("vite"), true);
   assert.equal(merged.questions.length, 1);
+});
+
+test("clampLmStudioConcurrency never exceeds the GPU cap", () => {
+  assert.equal(clampLmStudioConcurrency(undefined), LM_STUDIO_DEFAULT_CONCURRENCY);
+  assert.equal(clampLmStudioConcurrency(1), 1);
+  assert.equal(clampLmStudioConcurrency(2), 2);
+  assert.equal(clampLmStudioConcurrency(8), LM_STUDIO_MAX_CONCURRENCY);
+  assert.equal(clampLmStudioConcurrency(0), 1);
+  assert.equal(clampLmStudioConcurrency(-3), 1);
+});
+
+test("createSlotLimiter never exceeds the cap", async () => {
+  const limiter = createSlotLimiter(4);
+  let active = 0;
+  let peak = 0;
+  await Promise.all(
+    Array.from({ length: 12 }, async () => {
+      await limiter.run(async () => {
+        active += 1;
+        peak = Math.max(peak, active);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        active -= 1;
+      });
+    }),
+  );
+  assert.equal(peak <= LM_STUDIO_MAX_CONCURRENCY, true);
+  assert.equal(peak, 4);
 });
 
 test("runConcurrentIndexes runs every index", async () => {

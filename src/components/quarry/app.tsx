@@ -97,10 +97,13 @@ import {
   type Playbook,
 } from "@/lib/playbook";
 import { groupCampaigns } from "@/lib/review/campaigns";
+import { DEFAULT_CATALOG_BATCH_SIZE } from "@/lib/review/catalog";
 import { getGrokAvailability } from "@/lib/llm/availability";
 import { completeChat } from "@/lib/llm/complete";
 import { probeLmStudio, type LmStatus } from "@/lib/llm/lmstudio";
+import { pickReviewModel } from "@/lib/llm/lmstudio-url";
 import { parseReview } from "@/lib/review/parse";
+import { isEmptyRepoError } from "@/lib/github/throttle";
 import { buildPatchReviewMessages } from "@/lib/review/prompt";
 import {
   checkpointMatchesRepo,
@@ -110,11 +113,22 @@ import {
   pendingBatchIndexes,
   type QueueCheckpoint,
 } from "@/lib/review/checkpoint";
-import { markPartialReview, mergeReviewResults, type ReviewQueueProgress } from "@/lib/review/queue";
+import {
+  clampLmStudioConcurrency,
+  createSlotLimiter,
+  markPartialReview,
+  mergeReviewResults,
+  runConcurrentIndexes,
+  type ReviewQueueProgress,
+} from "@/lib/review/queue";
 import { runQueuedReview } from "@/lib/review/run-queued";
 import {
   clearRollout,
   createRollout,
+  claimNextPendingRepo,
+  recoverInterruptedRepos,
+  requeueRetryableErrors,
+  setRolloutPausedByUser,
   isRolloutFinished,
   loadRollout,
   markRolloutRepo,
@@ -201,6 +215,8 @@ export function QuarryApp() {
   const [defaultPlaybook, setDefaultPlaybook] = useState<Playbook>(() => emptyPlaybook());
   const [rollout, setRollout] = useState<RolloutJob | null>(null);
   const [rolloutBusy, setRolloutBusy] = useState(false);
+  const rolloutRef = useRef<RolloutJob | null>(null);
+  const rolloutBusyRef = useRef(false);
   const [searchingCode, setSearchingCode] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [searchNote, setSearchNote] = useState<string | null>(null);
@@ -236,8 +252,14 @@ export function QuarryApp() {
     void getGrokAvailability().then((value) => setGrokAvailable(value.grok));
     void probeLmStudio(next.lmStudioUrl).then((status) => {
       setLmStatus(status);
-      if (status.state === "online" && !next.lmStudioModel && status.models[0]) {
-        const seeded = { ...next, lmStudioModel: status.models[0] };
+      if (status.state !== "online") return;
+      const picked = pickReviewModel(
+        status.loaded,
+        status.models,
+        next.lmStudioModel,
+      );
+      if (picked && picked !== next.lmStudioModel) {
+        const seeded = { ...next, lmStudioModel: picked };
         setSettings(seeded);
         saveSettings(seeded);
       }
@@ -253,6 +275,42 @@ export function QuarryApp() {
     window.addEventListener("beforeunload", onLeave);
     return () => window.removeEventListener("beforeunload", onLeave);
   }, [phase, applying, rolloutBusy]);
+
+  useEffect(() => {
+    rolloutRef.current = rollout;
+  }, [rollout]);
+
+  useEffect(() => {
+    rolloutBusyRef.current = rolloutBusy;
+  }, [rolloutBusy]);
+
+  useEffect(() => {
+    if (!rolloutBusy || !("wakeLock" in navigator)) return;
+    let canceled = false;
+    let sentinel: WakeLockSentinel | null = null;
+    const grab = () => {
+      void navigator.wakeLock
+        .request("screen")
+        .then((lock) => {
+          if (canceled) {
+            void lock.release();
+            return;
+          }
+          sentinel = lock;
+        })
+        .catch(() => undefined);
+    };
+    grab();
+    const onVisible = () => {
+      if (document.visibilityState === "visible") grab();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      canceled = true;
+      document.removeEventListener("visibilitychange", onVisible);
+      void sentinel?.release();
+    };
+  }, [rolloutBusy]);
 
   useEffect(() => {
     const token = settings.githubToken.trim();
@@ -343,7 +401,7 @@ export function QuarryApp() {
       setError("Use owner/repo or a full GitHub URL.");
       return;
     }
-    abortRef.current?.abort();
+    if (!rolloutBusyRef.current) abortRef.current?.abort();
     abortFixRef.current?.abort();
     setApplying(false);
     setApplyProgress(null);
@@ -765,6 +823,7 @@ export function QuarryApp() {
         temperature: settings.temperature,
         maxFiles: settings.maxFiles,
         maxChars: settings.maxChars,
+        concurrency: clampLmStudioConcurrency(settings.lmStudioConcurrency),
         jobDigest: reviewJob ? formatJobDigest(reviewJob) : undefined,
         contextDigest: repoContext || undefined,
         signal: controller.signal,
@@ -886,19 +945,52 @@ export function QuarryApp() {
     }
   }
 
-  async function runRollout(existing?: RolloutJob | null) {
-    if (!pins.length && !existing?.repos.length) {
-      setError("Pin at least one repository.");
+  async function runRollout(
+    existing?: RolloutJob | null,
+    opts?: { repos?: string[]; batchSize?: number; source?: "watchlist" | "catalog" },
+  ) {
+    const queue = opts?.repos ?? existing?.repos ?? pins;
+    if (!queue.length) {
+      setError("No repositories to review. Refresh the catalog or pin some first.");
       return;
     }
     const prepared = await resolveModelTarget();
     if (!prepared) return;
+    if (rolloutBusyRef.current) return;
+    rolloutBusyRef.current = true;
+    let job: RolloutJob | null = null;
 
+    try {
     const token = settings.githubToken.trim();
-    let job =
-      existing && !isRolloutFinished(existing)
-        ? existing
-        : createRollout(pins, defaultPlaybook.lens ?? lens, defaultPlaybook);
+    const batchSize =
+      opts?.batchSize ??
+      existing?.batchSize ??
+      (opts?.source === "catalog" || existing?.source === "catalog"
+        ? DEFAULT_CATALOG_BATCH_SIZE
+        : queue.length);
+    const recovered = existing
+      ? requeueRetryableErrors(
+          recoverInterruptedRepos({
+            ...existing,
+            pausedByUser: false,
+            batchSize:
+              existing.source === "catalog" || opts?.source === "catalog"
+                ? 0
+                : existing.batchSize,
+          }),
+        )
+      : null;
+    job =
+      recovered && !isRolloutFinished(recovered)
+        ? recovered
+        : createRollout(queue, defaultPlaybook.lens ?? lens, defaultPlaybook, {
+            source: opts?.source ?? existing?.source ?? "watchlist",
+            batchSize:
+              opts?.source === "catalog" || existing?.source === "catalog"
+                ? 0
+                : batchSize,
+          });
+    if (!job) return;
     saveRollout(job);
     setRollout(job);
     setRolloutBusy(true);
@@ -908,131 +1000,247 @@ export function QuarryApp() {
 
     const controller = new AbortController();
     abortRef.current = controller;
-
-    try {
-      while (!controller.signal.aborted) {
-        const fullName = nextPendingRepo(job);
-        if (!fullName) break;
-        job = markRolloutRepo(job, fullName, "running");
+    const slots =
+      prepared.target === "lmstudio"
+        ? clampLmStudioConcurrency(settings.lmStudioConcurrency)
+        : 1;
+    const limiter = createSlotLimiter(slots);
+    let claimedThisSession = 0;
+    const sessionCap =
+      job.source === "catalog" || !(job.batchSize && job.batchSize > 0)
+        ? Number.POSITIVE_INFINITY
+        : job.batchSize;
+    let gate = Promise.resolve();
+    const mutateJob = (fn: (current: RolloutJob) => RolloutJob) => {
+      const next = gate.then(() => {
+        const current = job;
+        if (!current) throw new Error("Catalog job missing.");
+        job = fn(current);
         setRollout(job);
+        return job;
+      });
+      gate = next.then(
+        () => undefined,
+        () => undefined,
+      );
+      return next;
+    };
+    const claimRepo = async (): Promise<string | null> => {
+      let picked: string | null = null;
+      await mutateJob((current) => {
+        if (controller.signal.aborted || claimedThisSession >= sessionCap) {
+          return current;
+        }
+        const claimed = claimNextPendingRepo(current);
+        if (!claimed) return current;
+        claimedThisSession += 1;
+        picked = claimed.repo;
+        return claimed.job;
+      });
+      return picked;
+    };
 
-        const identity = parseRepoInput(fullName);
-        if (!identity) {
-          job = markRolloutRepo(job, fullName, "skipped", "Invalid repository name.");
-          setRollout(job);
-          continue;
-        }
-        const playbook = resolvePlaybook(
-          playbooks[playbookKey(identity.owner, identity.repo)],
-          job.playbook,
+    const reviewOne = async (fullName: string, attempt = 0) => {
+      const identity = parseRepoInput(fullName);
+      if (!identity) {
+        await mutateJob((current) =>
+          markRolloutRepo(current, fullName, "skipped", "Invalid repository name."),
         );
-        const reviewLens = playbook.lens ?? job.lens;
-        const opened = await openRepo({
-          source: fullName,
-          token: token || undefined,
-          lens: reviewLens,
-          maxFiles: settings.maxFiles,
-          maxChars: settings.maxChars,
-          playbook,
-        });
-        if (!opened.ok) {
-          job = markRolloutRepo(job, fullName, "error", opened.error);
-          setRollout(job);
-          continue;
+        return;
+      }
+      const playbook = resolvePlaybook(
+        playbooks[playbookKey(identity.owner, identity.repo)],
+        job?.playbook ?? defaultPlaybook,
+      );
+      const reviewLens = playbook.lens ?? job?.lens ?? lens;
+      const opened = await openRepo({
+        source: fullName,
+        token: token || undefined,
+        lens: reviewLens,
+        maxFiles: settings.maxFiles,
+        maxChars: settings.maxChars,
+        playbook,
+      });
+      if (!opened.ok) {
+        if (isEmptyRepoError(opened.error)) {
+          await mutateJob((current) =>
+            markRolloutRepo(current, fullName, "skipped", opened.error),
+          );
+          return;
         }
-        if (opened.data.selected.length === 0) {
-          job = markRolloutRepo(
-            job,
+        await mutateJob((current) =>
+          markRolloutRepo(current, fullName, "error", opened.error),
+        );
+        return;
+      }
+      if (opened.data.selected.length === 0) {
+        await mutateJob((current) =>
+          markRolloutRepo(
+            current,
             fullName,
             "skipped",
             "No files matched the playbook.",
-          );
-          setRollout(job);
-          continue;
-        }
+          ),
+        );
+        return;
+      }
 
-        try {
-          const outcome = await runQueuedReview({
-            bundle: opened.data,
-            selected: opened.data.selected,
-            contents: opened.data.contents,
-            lens: reviewLens,
-            target: prepared.target,
-            lmStudioUrl: settings.lmStudioUrl,
-            model: prepared.model,
-            temperature: settings.temperature,
-            maxFiles: settings.maxFiles,
-            maxChars: settings.maxChars,
-            signal: controller.signal,
-            existingCheckpoint: checkpointRef.current,
-            onCheckpoint: rememberCheckpoint,
-            onProgress: setQueueProgress,
-            onStream: setStreamText,
-            loadContents: async (batchPaths, base) => {
-              const missing = batchPaths.filter((path) => !base[path]);
-              if (missing.length === 0) return base;
-              const res = await fetchFileContents({
+      try {
+        const saved = checkpointRef.current;
+        const outcome = await runQueuedReview({
+          bundle: opened.data,
+          selected: opened.data.selected,
+          contents: opened.data.contents,
+          lens: reviewLens,
+          target: prepared.target,
+          lmStudioUrl: settings.lmStudioUrl,
+          model: prepared.model,
+          temperature: settings.temperature,
+          maxFiles: settings.maxFiles,
+          maxChars: settings.maxChars,
+          concurrency: slots,
+          signal: controller.signal,
+          existingCheckpoint: checkpointMatchesRepo(
+            saved,
+            opened.data.meta.owner,
+            opened.data.meta.repo,
+          )
+            ? saved
+            : null,
+          onCheckpoint: (next) => {
+            if (
+              next === null &&
+              checkpointRef.current &&
+              !checkpointMatchesRepo(
+                checkpointRef.current,
+                opened.data.meta.owner,
+                opened.data.meta.repo,
+              )
+            ) {
+              return;
+            }
+            rememberCheckpoint(next);
+          },
+          onProgress: (progress) => {
+            setQueueProgress(
+              progress
+                ? {
+                    ...progress,
+                    paths: progress.paths.length
+                      ? progress.paths
+                      : [fullName],
+                  }
+                : progress,
+            );
+          },
+          onStream: (text) => setStreamText(`${fullName}\n${text}`),
+          limitSlot: (work) => limiter.run(work),
+          loadContents: async (batchPaths, base) => {
+            const missing = batchPaths.filter((path) => !base[path]);
+            if (missing.length === 0) return base;
+            const res = await fetchFileContents({
+              owner: opened.data.meta.owner,
+              repo: opened.data.meta.repo,
+              paths: missing,
+              token: token || undefined,
+              ref: opened.data.headSha,
+            });
+            if (!res.ok) throw new Error(res.error);
+            return { ...base, ...res.data };
+          },
+        });
+        setProviderLabel(outcome.providerLabel);
+        if (outcome.status === "complete" && outcome.result) {
+          const reviewed = outcome.result;
+          setHistory((current) =>
+            pushHistory(
+              {
+                id: `${opened.data.meta.owner}/${opened.data.meta.repo}-${Date.now()}`,
+                savedAt: Date.now(),
                 owner: opened.data.meta.owner,
                 repo: opened.data.meta.repo,
-                paths: missing,
-                token: token || undefined,
-                ref: opened.data.headSha,
-              });
-              if (!res.ok) throw new Error(res.error);
-              return { ...base, ...res.data };
-            },
-          });
-          setProviderLabel(outcome.providerLabel);
-          if (outcome.status === "complete" && outcome.result) {
-            const reviewed = outcome.result;
-            setHistory((current) =>
-              pushHistory(
-                {
-                  id: `${opened.data.meta.owner}/${opened.data.meta.repo}-${Date.now()}`,
-                  savedAt: Date.now(),
-                  owner: opened.data.meta.owner,
-                  repo: opened.data.meta.repo,
-                  description: opened.data.meta.description,
-                  stars: opened.data.meta.stars,
-                  language: opened.data.meta.language,
-                  lens: reviewLens,
-                  providerLabel: outcome.providerLabel,
-                  result: reviewed,
-                },
-                current,
-              ),
-            );
-            job = markRolloutRepo(job, fullName, "done");
-          } else if (outcome.status === "paused") {
-            job = markRolloutRepo(job, fullName, "pending");
-            setRollout(job);
+                description: opened.data.meta.description,
+                stars: opened.data.meta.stars,
+                language: opened.data.meta.language,
+                lens: reviewLens,
+                providerLabel: outcome.providerLabel,
+                result: reviewed,
+              },
+              current,
+            ),
+          );
+          await mutateJob((current) => markRolloutRepo(current, fullName, "done"));
+        } else if (outcome.status === "paused") {
+          await mutateJob((current) =>
+            markRolloutRepo(current, fullName, "pending"),
+          );
+          if (controller.signal.aborted) {
             if (outcome.message) setError(outcome.message);
-            break;
-          } else {
-            job = markRolloutRepo(
-              job,
+            return;
+          }
+        } else {
+          if (attempt < 3 && !controller.signal.aborted) {
+            await new Promise((resolve) => window.setTimeout(resolve, 3000));
+            await reviewOne(fullName, attempt + 1);
+            return;
+          }
+          await mutateJob((current) =>
+            markRolloutRepo(
+              current,
               fullName,
               "error",
               outcome.message || "Review did not finish.",
-            );
-          }
-          setRollout(job);
-        } catch (err) {
-          if (controller.signal.aborted) {
-            job = markRolloutRepo(job, fullName, "pending");
-            setRollout(job);
-            break;
-          }
-          job = markRolloutRepo(
-            job,
-            fullName,
-            "error",
-            err instanceof Error ? err.message : "Review failed.",
+            ),
           );
-          setRollout(job);
         }
+      } catch (err) {
+        if (controller.signal.aborted) {
+          await mutateJob((current) =>
+            markRolloutRepo(current, fullName, "pending"),
+          );
+          return;
+        }
+        const message = err instanceof Error ? err.message : "Review failed.";
+        const transient = /abort|network|fetch|timeout|502|503|429|overload/i.test(
+          message,
+        );
+        if (transient && attempt < 4) {
+          await new Promise((resolve) => window.setTimeout(resolve, 4000));
+          if (!controller.signal.aborted) {
+            await reviewOne(fullName, attempt + 1);
+            return;
+          }
+        }
+        await mutateJob((current) =>
+          markRolloutRepo(current, fullName, "error", message),
+        );
+      }
+    };
+
+    await runConcurrentIndexes({
+        indexes: Array.from({ length: slots }, (_, i) => i),
+        concurrency: slots,
+        signal: controller.signal,
+        worker: async () => {
+          while (!controller.signal.aborted) {
+            const fullName = await claimRepo();
+            if (!fullName) return;
+            await reviewOne(fullName);
+          }
+        },
+      });
+      if (
+        !controller.signal.aborted &&
+        claimedThisSession >= sessionCap &&
+        nextPendingRepo(job)
+      ) {
+        const left = rolloutCounts(job).pending;
+        setSearchNote(
+          `Review-only batch finished (${claimedThisSession}). ${left} waiting. Resume for the next session.`,
+        );
       }
     } finally {
+      rolloutBusyRef.current = false;
       setRolloutBusy(false);
       setQueueProgress(null);
       if (job && isRolloutFinished(job)) {
@@ -1049,9 +1257,23 @@ export function QuarryApp() {
     setRollout(null);
   }
   function cancelReview() {
+    const current = rolloutRef.current;
+    if (current && rolloutBusyRef.current) {
+      setRollout(setRolloutPausedByUser(current, true));
+    }
     abortRef.current?.abort();
     abortFixRef.current?.abort();
   }
+
+  useEffect(() => {
+    if (lmStatus.state !== "online") return;
+    if (rolloutBusyRef.current) return;
+    const stored = loadRollout();
+    if (!stored || stored.source !== "catalog" || stored.pausedByUser) return;
+    const recovered = requeueRetryableErrors(recoverInterruptedRepos(stored));
+    if (isRolloutFinished(recovered)) return;
+    void runRollout(recovered);
+  }, [lmStatus.state]);
 
   async function runApplyFixes(findingIds: string[]) {
     if (!bundle || !result || result.kind !== "structured") return;
@@ -1412,7 +1634,15 @@ export function QuarryApp() {
               streamText={streamText}
               queueProgress={queueProgress}
               onStartRollout={() => void runRollout()}
+              onStartCatalog={(repos, batchSize) =>
+                void runRollout(null, {
+                  repos,
+                  batchSize,
+                  source: "catalog",
+                })
+              }
               onResumeRollout={() => void runRollout(rollout)}
+              onRetryGithub={() => void runRollout(rollout)}
               onStopRollout={cancelReview}
               onDismissRollout={dismissRollout}
             />
@@ -1552,7 +1782,9 @@ function Landing({
   streamText,
   queueProgress,
   onStartRollout,
+  onStartCatalog,
   onResumeRollout,
+  onRetryGithub,
   onStopRollout,
   onDismissRollout,
 }: {
@@ -1591,7 +1823,9 @@ function Landing({
   streamText: string;
   queueProgress: ReviewQueueProgress | null;
   onStartRollout: () => void;
+  onStartCatalog: (repos: string[], batchSize: number) => void;
   onResumeRollout: () => void;
+  onRetryGithub: () => void;
   onStopRollout: () => void;
   onDismissRollout: () => void;
 }) {
@@ -1708,6 +1942,11 @@ function Landing({
         playbook={defaultPlaybook}
         onPlaybook={onDefaultPlaybook}
         pinCount={pins.length}
+        catalogRepos={accessible.status === "ready" ? accessible.repos : []}
+        catalogTruncated={accessible.status === "ready" ? accessible.truncated : false}
+        lastReviewedAt={Object.fromEntries(
+          Object.entries(lastReviewed).map(([key, value]) => [key, value.savedAt]),
+        )}
         tokenReady={tokenReady}
         modelReady={modelReady}
         searching={searching}
@@ -1719,7 +1958,9 @@ function Landing({
         streamText={streamText}
         queueProgress={queueProgress}
         onStart={onStartRollout}
+        onStartCatalog={onStartCatalog}
         onResume={onResumeRollout}
+        onRetryGithub={onRetryGithub}
         onStop={onStopRollout}
         onDismiss={onDismissRollout}
       />

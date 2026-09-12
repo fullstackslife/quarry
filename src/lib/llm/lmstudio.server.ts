@@ -1,6 +1,10 @@
 import { env } from "@/lib/env.server";
 import { formatModelHttpError } from "./openai-stream";
-import { resolveLmStudioBaseUrl } from "./lmstudio-url";
+import {
+  isChatModelId,
+  resolveLmStudioBaseUrl,
+  toNativeLmStudioUrl,
+} from "./lmstudio-url";
 
 export function lmStudioAuthHeader(): string {
   return `Bearer ${env("LM_API_TOKEN") ?? "lm-studio"}`;
@@ -8,6 +12,25 @@ export function lmStudioAuthHeader(): string {
 
 export function lmStudioBaseUrl(requested?: string): string {
   return resolveLmStudioBaseUrl(requested, env("LM_STUDIO_URL"));
+}
+
+async function fetchLoadedModelIds(openaiBase: string): Promise<string[]> {
+  const native = toNativeLmStudioUrl(openaiBase);
+  try {
+    const res = await fetch(`${native}/api/v0/models`, {
+      headers: { Authorization: lmStudioAuthHeader() },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return [];
+    const json = (await res.json()) as {
+      data?: { id?: string; state?: string }[];
+    };
+    return (json.data ?? [])
+      .filter((item) => item.state === "loaded" && item.id)
+      .map((item) => item.id as string);
+  } catch {
+    return [];
+  }
 }
 
 export async function fetchLmStudioModels(
@@ -35,10 +58,27 @@ export async function fetchLmStudioModels(
       };
     }
     const json = (await res.json()) as { data?: { id?: string }[] };
-    const models = (json.data ?? [])
+    const downloaded = (json.data ?? [])
       .map((item) => item.id)
       .filter((id): id is string => Boolean(id));
-    return { state: "online", models, url: base };
+
+    const loaded = await fetchLoadedModelIds(base);
+    const chatLoaded = loaded.filter(isChatModelId);
+    const chatAll = downloaded.filter(isChatModelId);
+    const models = [
+      ...chatLoaded,
+      ...chatAll.filter((id) => !chatLoaded.includes(id)),
+    ];
+    if (models.length === 0 && downloaded.length) {
+      models.push(...downloaded);
+    }
+
+    return {
+      state: "online",
+      models,
+      loaded: chatLoaded,
+      url: base,
+    };
   } catch (err) {
     const message = err instanceof Error ? err.message : "";
     if (message.toLowerCase().includes("abort")) {

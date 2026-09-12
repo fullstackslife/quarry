@@ -1,7 +1,14 @@
 export const DEFAULT_LM_STUDIO_URL = "http://127.0.0.1:1234/v1";
 
+/** Same stack lm-studio-tools loads on the Tailscale box. Prefer these when they are in RAM. */
+export const PREFERRED_REVIEW_MODELS = [
+  "qwen2.5-coder-7b-instruct",
+  "qwen/qwen3.5-9b",
+  "google/gemma-4-e4b",
+];
+
 export type LmProbeResult =
-  | { state: "online"; models: string[]; url: string }
+  | { state: "online"; models: string[]; loaded: string[]; url: string }
   | { state: "offline"; reason: string; url?: string };
 
 export function normalizeBaseUrl(url: string): string {
@@ -17,6 +24,41 @@ export function toOpenAiBaseUrl(url: string): string {
     base = `${base}/v1`;
   }
   return base;
+}
+
+/** Native LM Studio host (`:1234`) for `/api/v0/models` inventory. */
+export function toNativeLmStudioUrl(url: string): string {
+  const openai = toOpenAiBaseUrl(url);
+  return openai.endsWith("/v1") ? openai.slice(0, -3).replace(/\/+$/, "") : openai;
+}
+
+export function isEmbeddingModelId(id: string): boolean {
+  const lower = id.toLowerCase();
+  return lower.includes("embed");
+}
+
+export function isChatModelId(id: string): boolean {
+  return Boolean(id.trim()) && !isEmbeddingModelId(id);
+}
+
+/** Prefer a model that is actually loaded, matching lm-studio-tools coder/agent picks. */
+export function pickReviewModel(
+  loaded: string[],
+  downloaded: string[],
+  current?: string,
+): string {
+  const chatLoaded = loaded.filter(isChatModelId);
+  const pool = chatLoaded.length ? chatLoaded : downloaded.filter(isChatModelId);
+  const wanted = current?.trim() || "";
+  if (wanted && pool.includes(wanted)) return wanted;
+  for (const preferred of PREFERRED_REVIEW_MODELS) {
+    if (pool.includes(preferred)) return preferred;
+  }
+  const coder = pool.find(
+    (id) => /coder/i.test(id) && !/1\.5b/i.test(id),
+  );
+  if (coder) return coder;
+  return pool[0] ?? wanted;
 }
 
 function ipv4ToInt(host: string): number | null {

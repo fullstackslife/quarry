@@ -6,6 +6,7 @@ import {
   checkpointId,
   clearCheckpoint,
   completedBatchCount,
+  loadCheckpoint,
   pendingBatchIndexes,
   saveCheckpoint,
   writeBatchResult,
@@ -14,7 +15,7 @@ import {
 import {
   BATCH_MAX_CHARS,
   compactBatchForMerge,
-  LM_STUDIO_CONCURRENCY,
+  clampLmStudioConcurrency,
   markPartialReview,
   mergeReviewResults,
   queueReviewBatches,
@@ -36,6 +37,7 @@ export type RunQueuedReviewInput = {
   temperature: number;
   maxFiles: number;
   maxChars: number;
+  concurrency?: number;
   jobDigest?: string;
   contextDigest?: string;
   signal: AbortSignal;
@@ -47,6 +49,8 @@ export type RunQueuedReviewInput = {
     paths: string[],
     base: Record<string, string>,
   ) => Promise<Record<string, string>>;
+  /** Shared GPU slots so catalog repos cannot exceed Parallel N together. */
+  limitSlot?: <T>(work: () => Promise<T>) => Promise<T>;
 };
 
 export type RunQueuedReviewOutcome = {
@@ -163,10 +167,15 @@ export async function runQueuedReview(
 
   publishProgress(job);
 
+  const takeSlot = input.limitSlot ?? (<T>(work: () => Promise<T>) => work());
+
   try {
     await runConcurrentIndexes({
       indexes: pendingBatchIndexes(job),
-      concurrency: input.target === "lmstudio" ? LM_STUDIO_CONCURRENCY : 1,
+      concurrency:
+        input.target === "lmstudio"
+          ? clampLmStudioConcurrency(input.concurrency)
+          : 1,
       signal: input.signal,
       worker: async (index) => {
         const batchPaths = job.batches[index] ?? [];
@@ -194,7 +203,8 @@ export async function runQueuedReview(
           jobDigest: input.jobDigest,
           contextDigest: input.contextDigest,
         });
-        const text = await completeChat({
+        const text = await takeSlot(() =>
+          completeChat({
           target: input.target,
           lmStudioUrl: input.lmStudioUrl,
           model: input.model,
@@ -210,7 +220,8 @@ export async function runQueuedReview(
               .join("\n\n");
             input.onStream(body);
           },
-        });
+        }),
+        );
         const parsedBatch = parseReview(text);
         job = writeBatchResult(job, index, parsedBatch);
         running.delete(index);
@@ -276,7 +287,8 @@ export async function runQueuedReview(
     );
     let mergeBuf = "";
     try {
-      const mergeText = await completeChat({
+      const mergeText = await takeSlot(() =>
+        completeChat({
         target: input.target,
         lmStudioUrl: input.lmStudioUrl,
         model: input.model,
@@ -293,7 +305,8 @@ export async function runQueuedReview(
           mergeBuf += chunk;
           input.onStream(mergeBuf);
         },
-      });
+      }),
+      );
       const merged = parseReview(mergeText);
       if (merged.kind === "structured") parsed = merged;
     } catch {
@@ -315,7 +328,8 @@ export async function runQueuedReview(
     );
   }
 
-  clearCheckpoint();
+  const stored = loadCheckpoint();
+  if (stored?.id === job.id) clearCheckpoint();
   input.onCheckpoint(null);
   input.onProgress(null);
   return { status: "complete", result: parsed, providerLabel };

@@ -22,7 +22,7 @@
     "preview:stop": "node scripts/preview.mjs stop",
     "typecheck": "tsc --noEmit",
     "check:auth": "node scripts/check-auth-invariant.mjs",
-    "test": "node --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/app-data/readiness-schedule.test.ts src/lib/auth/gate-identity.test.ts src/lib/auth/sign-in-gate.test.ts src/lib/llm/lmstudio-url.test.ts src/lib/review/queue.test.ts src/lib/review/checkpoint.test.ts src/lib/github/branch.test.ts src/lib/github/repos.test.ts src/lib/github/jobs.test.ts src/lib/github/write-target.test.ts src/lib/github/search.test.ts src/lib/github/create.test.ts src/lib/github/issues.test.ts src/lib/fix/parse.test.ts src/lib/playbook.test.ts src/lib/review/campaigns.test.ts src/lib/review/rollout.test.ts src/lib/sync/dump.test.ts",
+    "test": "node --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/app-data/readiness-schedule.test.ts src/lib/auth/gate-identity.test.ts src/lib/auth/sign-in-gate.test.ts src/lib/llm/lmstudio-url.test.ts src/lib/review/queue.test.ts src/lib/review/checkpoint.test.ts src/lib/github/branch.test.ts src/lib/github/repos.test.ts src/lib/github/jobs.test.ts src/lib/github/write-target.test.ts src/lib/github/search.test.ts src/lib/github/create.test.ts src/lib/github/issues.test.ts src/lib/github/throttle.test.ts src/lib/fix/parse.test.ts src/lib/playbook.test.ts src/lib/review/campaigns.test.ts src/lib/review/catalog.test.ts src/lib/review/rollout.test.ts src/lib/sync/dump.test.ts",
     "lint": "eslint .",
     "format": "prettier --write ."
   },

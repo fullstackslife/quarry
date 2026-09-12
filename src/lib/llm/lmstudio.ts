@@ -9,17 +9,23 @@ export { normalizeBaseUrl } from "./lmstudio-url";
 export async function probeLmStudio(baseUrl: string): Promise<LmProbeResult> {
   try {
     const res = await fetch(`/api/lm?baseUrl=${encodeURIComponent(baseUrl)}`, {
-      signal: AbortSignal.timeout(4000),
+      signal: AbortSignal.timeout(8000),
     });
     const json = (await res.json()) as {
       state?: string;
       models?: string[];
+      loaded?: string[];
       url?: string;
       reason?: string;
       error?: string;
     };
     if (json.state === "online") {
-      return { state: "online", models: json.models ?? [], url: json.url ?? baseUrl };
+      return {
+        state: "online",
+        models: json.models ?? [],
+        loaded: json.loaded ?? [],
+        url: json.url ?? baseUrl,
+      };
     }
     if (json.state === "offline") {
       return { state: "offline", reason: json.reason || json.error || "LM Studio probe failed.", url: json.url };

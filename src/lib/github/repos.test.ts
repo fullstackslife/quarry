@@ -38,6 +38,8 @@ test("filterAccessibleRepos matches name and hides public when asked", () => {
       language: "Go",
       pushedAt: null,
       htmlUrl: "https://github.com/acme/secret",
+      fork: false,
+      archived: false,
     },
     {
       owner: "acme",
@@ -48,6 +50,8 @@ test("filterAccessibleRepos matches name and hides public when asked", () => {
       language: "TypeScript",
       pushedAt: null,
       htmlUrl: "https://github.com/acme/website",
+      fork: false,
+      archived: false,
     },
   ];
   assert.equal(filterAccessibleRepos(repos, "", "all").length, 2);

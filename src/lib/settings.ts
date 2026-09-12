@@ -1,4 +1,8 @@
 import { DEFAULT_LM_STUDIO_URL } from "./llm/lmstudio-url";
+import {
+  clampLmStudioConcurrency,
+  LM_STUDIO_DEFAULT_CONCURRENCY,
+} from "./review/queue";
 
 export type ProviderId = "auto" | "lmstudio" | "grok";
 
@@ -10,6 +14,8 @@ export type Settings = {
   temperature: number;
   maxFiles: number;
   maxChars: number;
+  /** In-flight LM Studio completions. Capped at 2. */
+  lmStudioConcurrency: number;
 };
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -20,6 +26,7 @@ export const DEFAULT_SETTINGS: Settings = {
   temperature: 0.2,
   maxFiles: 16,
   maxChars: 48000,
+  lmStudioConcurrency: LM_STUDIO_DEFAULT_CONCURRENCY,
 };
 
 const KEY = "quarry.settings.v1";
@@ -45,6 +52,7 @@ export function loadSettings(): Settings {
       maxFiles: Math.min(Math.max(Number(parsed.maxFiles) || 16, 4), 24),
       maxChars: Math.min(Math.max(Number(parsed.maxChars) || 48000, 8000), 160000),
       temperature: Math.min(Math.max(Number(parsed.temperature) || 0.2, 0), 1.2),
+      lmStudioConcurrency: clampLmStudioConcurrency(parsed.lmStudioConcurrency),
     };
   } catch {
     return DEFAULT_SETTINGS;

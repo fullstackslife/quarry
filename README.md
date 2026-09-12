@@ -46,7 +46,9 @@ On Overview you can review the default branch, an open PR, another branch, or an
 
 Pin repositories from **Your repositories**, or **Find and pin** with GitHub code search (for example `warbot`) using the same token. Quarry runs that search through this app (not the browser) and scopes a bare query to your user and organizations. Set a **campaign playbook** (lens plus include/ignore globs). That playbook applies to every pinned repo unless the repo has its own playbook.
 
-**Review pinned** walks the watchlist **one repository at a time** so a single LM Studio GPU is not swapping two trees. Inside a repo, file batches still run with the existing local concurrency. Stop pauses; Resume continues pending repos. Each finished review is written to History, and matching finding titles across repos show up as cross-repo patterns.
+**Review catalog** walks every repository the token can list (up to 3,000), **one at a time**, in sessions of 8 / 12 / 20. Newest push first. Archived and forks are skipped unless you uncheck those filters. Already-reviewed trees are skipped when GitHub has not pushed since the last History entry. Stop pauses; Resume runs the next session. This path is review-only — it does not apply fixes or open PRs.
+
+**Review pinned** still walks the watchlist the same way.
 
 Code search needs a token that can search the repositories you care about (classic `repo` is enough).
 

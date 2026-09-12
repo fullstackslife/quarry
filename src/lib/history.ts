@@ -2,7 +2,7 @@ import type { ReviewRecord } from "./review/types.ts";
 import { reviewToMarkdown } from "./review/parse.ts";
 
 const KEY = "quarry.history.v1";
-export const HISTORY_LIMIT = 100;
+export const HISTORY_LIMIT = 2000;
 
 export type ReviewIndex = {
   savedAt: number;
