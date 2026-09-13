@@ -43,29 +43,29 @@ export function ApplyFixesPanel({
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-            Apply on a new branch
+            Improve in the workspace
           </p>
           <h3 className="mt-1 font-display text-xl tracking-tight">
-            Never writes to {defaultBranch}
+            Draft patches, then commit on quarry/*
           </h3>
           <p className="mt-2 max-w-xl text-sm leading-relaxed text-muted-foreground">
             {writeHint ||
-              `Quarry asks the local model for updated file text, commits on quarry/fix-… from the current ${defaultBranch} tip, then opens a pull request. ${defaultBranch} is not updated.`}
+              `Quarry searches the tree, reads related files, and proposes diffs the way an editor agent would. You accept hunks in Workspace, then Quarry commits on quarry/* from the current ${defaultBranch} tip and opens a pull request. ${defaultBranch} is not updated.`}
           </p>
         </div>
         <Button
           type="button"
           onClick={() => onApply(ids)}
-          disabled={applying || selected.length === 0 || !hasToken}
+          disabled={applying || selected.length === 0}
         >
           {applying ? <Loader2 className="animate-spin" /> : <GitBranch />}
-          {applying ? "Applying…" : `Commit ${fileCount} files on quarry/*`}
+          {applying ? "Drafting…" : `Draft ${fileCount} file${fileCount === 1 ? "" : "s"}`}
         </Button>
       </div>
       {!hasToken ? (
         <p className="mt-3 text-sm text-warn">
-          Add a GitHub token with Contents write and Pull requests write in
-          Settings.
+          Drafts work without a write token. Add Contents write and Pull
+          requests write in Settings before committing.
         </p>
       ) : null}
       <ul className="mt-4 space-y-2">

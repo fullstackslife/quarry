@@ -38,7 +38,9 @@ export function isEmbeddingModelId(id: string): boolean {
 }
 
 export function isChatModelId(id: string): boolean {
-  return Boolean(id.trim()) && !isEmbeddingModelId(id);
+  const lower = id.trim().toLowerCase();
+  if (!lower || isEmbeddingModelId(lower)) return false;
+  return !/(^|\/|-)(asr|whisper|tts|vocoder|speech)($|\/|-)/i.test(lower);
 }
 
 /** Prefer a model that is actually loaded, matching lm-studio-tools coder/agent picks. */

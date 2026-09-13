@@ -30,6 +30,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { FileList } from "@/components/quarry/file-list";
+import { CodeWorkspace } from "@/components/quarry/code-workspace";
 import { QuarryMark } from "@/components/quarry/mark";
 import { Report } from "@/components/quarry/report";
 import { SettingsSheet } from "@/components/quarry/settings-sheet";
@@ -70,8 +71,16 @@ import { formatContextDigest, loadRepoContext } from "@/lib/github/context";
 import { appendPullBody, formatVerifySection, pollCommitChecks } from "@/lib/github/checks";
 import { resolveFixWriteTarget } from "@/lib/github/write-target";
 import { commitJobFixes, type BranchPushResult } from "@/lib/github/write";
-import { parseFileChanges } from "@/lib/fix/parse";
-import { buildFixFileMessages, groupFindingsByFile } from "@/lib/fix/prompt";
+import { groupFindingsByFile } from "@/lib/fix/prompt";
+import { buildAgentSystemPrompt, buildAgentTask } from "@/lib/agent/prompt";
+import { runCodingAgent, type AgentLogItem } from "@/lib/agent/run";
+import {
+  acceptedChanges,
+  removeDraft,
+  setDraftAccepted,
+  upsertDraft,
+  type DraftFile,
+} from "@/lib/workspace/buffer";
 import { parseRepoInput } from "@/lib/github/parse";
 import { pickSmartFiles } from "@/lib/github/select";
 import type { RepoBundle } from "@/lib/github/types";
@@ -203,6 +212,10 @@ export function QuarryApp() {
   const [applyProgress, setApplyProgress] = useState<string | null>(null);
   const [applyResult, setApplyResult] = useState<BranchPushResult | null>(null);
   const [applyError, setApplyError] = useState<string | null>(null);
+  const [drafts, setDrafts] = useState<DraftFile[]>([]);
+  const [openPath, setOpenPath] = useState<string | null>(null);
+  const [agentBusy, setAgentBusy] = useState(false);
+  const [agentLog, setAgentLog] = useState<AgentLogItem[]>([]);
   const abortRef = useRef<AbortController | null>(null);
   const abortFixRef = useRef<AbortController | null>(null);
   const checkpointRef = useRef<QueueCheckpoint | null>(null);
@@ -407,6 +420,10 @@ export function QuarryApp() {
     setApplyProgress(null);
     setApplyResult(null);
     setApplyError(null);
+    setDrafts([]);
+    setOpenPath(null);
+    setAgentBusy(false);
+    setAgentLog([]);
     setError(null);
     if (!keepResult) {
       setResult(null);
@@ -757,8 +774,9 @@ export function QuarryApp() {
       }
       lmModels = status.models;
       target = "lmstudio";
-      if (!settings.lmStudioModel && status.models[0]) {
-        updateSettings({ ...settings, lmStudioModel: status.models[0] });
+      const picked = pickReviewModel(status.loaded, status.models, settings.lmStudioModel);
+      if (picked && picked !== settings.lmStudioModel) {
+        updateSettings({ ...settings, lmStudioModel: picked });
       }
     }
     if (target !== "lmstudio" && target !== "grok") {
@@ -770,7 +788,11 @@ export function QuarryApp() {
     }
     const model =
       target === "lmstudio"
-        ? settings.lmStudioModel || lmModels[0] || ""
+        ? pickReviewModel(
+            lmStatus.state === "online" ? lmStatus.loaded : [],
+            lmModels,
+            settings.lmStudioModel,
+          )
         : "grok-4.5";
     if (target === "lmstudio" && !model) {
       setError("Pick a loaded LM Studio model in Settings.");
@@ -1275,8 +1297,129 @@ export function QuarryApp() {
     void runRollout(recovered);
   }, [lmStatus.state]);
 
+  async function openWorkspaceFile(path: string) {
+    setOpenPath(path);
+    try {
+      await ensureContents([path]);
+    } catch (err) {
+      setApplyError(err instanceof Error ? err.message : "Could not load file.");
+    }
+  }
+
+  async function runComposer(instruction: string, findingIds?: string[]) {
+    if (!bundle) return;
+    const prepared = await resolveModelTarget();
+    if (!prepared) {
+      setApplyError(
+        "No model is available. Connect LM Studio in Settings, or wait for hosted review.",
+      );
+      return;
+    }
+    const findings =
+      result?.kind === "structured" && findingIds?.length
+        ? result.findings.filter((finding) => findingIds.includes(finding.id))
+        : [];
+    const seedPaths = [...groupFindingsByFile(findings).keys()];
+    const controller = new AbortController();
+    abortFixRef.current = controller;
+    setAgentBusy(true);
+    setApplyError(null);
+    setTab("files");
+    setApplyProgress("Starting coding agent…");
+    try {
+      const loaded = seedPaths.length ? await ensureContents(seedPaths) : contents;
+      const working = { ...loaded };
+      const originals = { ...loaded };
+      const outcome = await runCodingAgent({
+        messages: [
+          { role: "system", content: buildAgentSystemPrompt() },
+          {
+            role: "user",
+            content: buildAgentTask({
+              owner: bundle.meta.owner,
+              repo: bundle.meta.repo,
+              jobLabel: reviewJob ? `${reviewJob.kind} ${reviewJob.head}` : undefined,
+              paths: bundle.files.map((file) => file.path).slice(0, 120),
+              findings,
+              instruction,
+            }),
+          },
+        ],
+        host: {
+          paths: bundle.files.map((file) => file.path),
+          contents: working,
+          loadFile: async (path) => {
+            const next = await ensureContents([path], { ...contents, ...working });
+            const text = next[path] ?? "";
+            if (!(path in originals)) originals[path] = text;
+            if (working[path] == null) working[path] = text;
+            return working[path] || text;
+          },
+          writeFile: (path, content) => {
+            working[path] = content;
+          },
+        },
+        complete: (messages) =>
+          completeChat({
+            target: prepared.target,
+            lmStudioUrl: settings.lmStudioUrl,
+            model: prepared.model,
+            messages,
+            temperature: 0.15,
+            signal: controller.signal,
+            onDelta: () => {},
+          }),
+        maxSteps: 10,
+        signal: controller.signal,
+        onProgress: setApplyProgress,
+      });
+      setAgentLog(outcome.log);
+      setDrafts((current) => {
+        let next = current;
+        for (const change of outcome.changes) {
+          next = upsertDraft(
+            next,
+            change.path,
+            originals[change.path] ?? "",
+            change.content,
+          );
+        }
+        return next;
+      });
+      if (outcome.changes[0]) setOpenPath(outcome.changes[0].path);
+      if (outcome.changes.length === 0) {
+        setApplyError(outcome.summary || "The agent did not produce a patch.");
+      }
+      setApplyProgress(null);
+    } catch (err) {
+      if (controller.signal.aborted) {
+        setApplyError("Agent cancelled.");
+        return;
+      }
+      setApplyError(err instanceof Error ? err.message : "Agent failed.");
+    } finally {
+      setAgentBusy(false);
+      if (abortFixRef.current === controller) abortFixRef.current = null;
+    }
+  }
+
   async function runApplyFixes(findingIds: string[]) {
-    if (!bundle || !result || result.kind !== "structured") return;
+    if (!result || result.kind !== "structured") return;
+    const findings = result.findings.filter(
+      (finding) => findingIds.includes(finding.id) && finding.file,
+    );
+    if (findings.length === 0) {
+      setApplyError("Select findings that include a file path.");
+      return;
+    }
+    await runComposer(
+      "Apply these review findings with the smallest correct patches. Search related call sites before editing. Prefer str_replace or apply_patch over rewriting whole files.",
+      findingIds,
+    );
+  }
+
+  async function commitDrafts() {
+    if (!bundle) return;
     const token = settings.githubToken.trim();
     if (!token) {
       setApplyError(
@@ -1285,40 +1428,12 @@ export function QuarryApp() {
       setSettingsOpen(true);
       return;
     }
-    const findings = result.findings.filter(
-      (finding) => findingIds.includes(finding.id) && finding.file,
-    );
-    const groups = groupFindingsByFile(findings);
-    if (groups.size === 0) {
-      setApplyError("Select findings that include a file path.");
+    const changes = acceptedChanges(drafts);
+    if (changes.length === 0) {
+      setApplyError("Accept at least one draft before committing.");
       return;
     }
-    if (!resolvedTarget) {
-      setApplyError(
-        "No model is available. Connect LM Studio in Settings, or wait for hosted review.",
-      );
-      setSettingsOpen(true);
-      return;
-    }
-
-    let target = resolvedTarget;
-    let lmModels: string[] =
-      lmStatus.state === "online" ? lmStatus.models : [];
-    if (settings.provider === "lmstudio" && lmStatus.state !== "online") {
-      const status = await probeLmStudio(settings.lmStudioUrl);
-      setLmStatus(status);
-      if (status.state !== "online") {
-        setApplyError(status.reason);
-        setSettingsOpen(true);
-        return;
-      }
-      lmModels = status.models;
-      target = "lmstudio";
-      if (!settings.lmStudioModel && status.models[0]) {
-        updateSettings({ ...settings, lmStudioModel: status.models[0] });
-      }
-    }
-
+    const prepared = await resolveModelTarget();
     const controller = new AbortController();
     abortFixRef.current = controller;
     setApplying(true);
@@ -1329,45 +1444,6 @@ export function QuarryApp() {
     setTab("review");
 
     try {
-      const paths = [...groups.keys()];
-      const loaded = await ensureContents(paths, contents);
-      const changes = [];
-      let index = 0;
-      const model =
-        target === "lmstudio"
-          ? settings.lmStudioModel || lmModels[0] || ""
-          : "grok-4.5";
-
-      for (const [path, fileFindings] of groups) {
-        index += 1;
-        setApplyProgress(`Rewriting ${index}/${groups.size} · ${path}`);
-        const current = loaded[path];
-        if (!current?.trim()) {
-          throw new Error(`Could not load ${path} from GitHub.`);
-        }
-        const text = await completeChat({
-          target,
-          lmStudioUrl: settings.lmStudioUrl,
-          model,
-          messages: buildFixFileMessages({
-            owner: bundle.meta.owner,
-            repo: bundle.meta.repo,
-            path,
-            current,
-            findings: fileFindings,
-          }),
-          temperature: 0.1,
-          signal: controller.signal,
-          onDelta: () => {},
-        });
-        const parsed = parseFileChanges(text).filter((file) => file.path === path);
-        const next = parsed[0];
-        if (!next) {
-          throw new Error(`The model did not return a valid update for ${path}.`);
-        }
-        changes.push(next);
-      }
-
       const jobHead = reviewJob?.head || bundle.meta.defaultBranch;
       const jobBase = reviewJob?.base || bundle.meta.defaultBranch;
       setApplyProgress(`Writing quarry/* from ${jobHead}`);
@@ -1390,10 +1466,8 @@ export function QuarryApp() {
             ? `Closes #${reviewJob.number}`
             : "",
           "",
-          "Findings:",
-          ...findings.map(
-            (finding) => `- ${finding.title} (\`${finding.file}\`)`,
-          ),
+          "Changes:",
+          ...changes.map((file) => `- \`${file.path}\``),
         ]
           .filter(Boolean)
           .join("\n"),
@@ -1403,27 +1477,36 @@ export function QuarryApp() {
         return;
       }
       setApplyResult(pushed.data);
+      setDrafts((current) =>
+        current.filter((item) => !changes.some((file) => file.path === item.path)),
+      );
+      setContents((current) => ({
+        ...current,
+        ...Object.fromEntries(changes.map((file) => [file.path, file.content])),
+      }));
       const written = Object.fromEntries(changes.map((file) => [file.path, file.content]));
-      setApplyProgress("Re-reviewing the patch…");
-      try {
-        const patchText = await completeChat({
-          target,
-          lmStudioUrl: settings.lmStudioUrl,
-          model,
-          messages: buildPatchReviewMessages({
-            meta: bundle.meta,
-            lens,
-            paths: changes.map((file) => file.path),
-            contents: written,
-            maxChars: 16_000,
-          }),
-          temperature: 0.1,
-          signal: controller.signal,
-          onDelta: () => {},
-        });
-        setPatchResult(parseReview(patchText));
-      } catch {
-        setPatchResult(null);
+      if (prepared) {
+        setApplyProgress("Re-reviewing the patch…");
+        try {
+          const patchText = await completeChat({
+            target: prepared.target,
+            lmStudioUrl: settings.lmStudioUrl,
+            model: prepared.model,
+            messages: buildPatchReviewMessages({
+              meta: bundle.meta,
+              lens,
+              paths: changes.map((file) => file.path),
+              contents: written,
+              maxChars: 16_000,
+            }),
+            temperature: 0.1,
+            signal: controller.signal,
+            onDelta: () => {},
+          });
+          setPatchResult(parseReview(patchText));
+        } catch {
+          setPatchResult(null);
+        }
       }
       if (pushed.data.prNumber) {
         setApplyProgress("Checking GitHub status…");
@@ -1502,6 +1585,10 @@ export function QuarryApp() {
     setApplyProgress(null);
     setApplyResult(null);
     setApplyError(null);
+    setDrafts([]);
+    setOpenPath(null);
+    setAgentBusy(false);
+    setAgentLog([]);
     setReviewJob(null);
     setRepoContext("");
     setPatchResult(null);
@@ -1681,6 +1768,17 @@ export function QuarryApp() {
               applyError={applyError}
               hasGithubToken={Boolean(settings.githubToken.trim())}
               onApplyFixes={runApplyFixes}
+              drafts={drafts}
+              openPath={openPath}
+              agentBusy={agentBusy}
+              agentLog={agentLog}
+              onOpenPath={(path) => void openWorkspaceFile(path)}
+              onToggleDraft={(path, accepted) =>
+                setDrafts((current) => setDraftAccepted(current, path, accepted))
+              }
+              onDiscardDraft={(path) => setDrafts((current) => removeDraft(current, path))}
+              onCommitDrafts={() => void commitDrafts()}
+              onRunAgent={(instruction) => void runComposer(instruction)}
               reviewJob={reviewJob}
               jobLists={jobLists}
               jobLoading={jobLoading}
@@ -2037,6 +2135,15 @@ function Workspace({
   applyError,
   hasGithubToken,
   onApplyFixes,
+  drafts,
+  openPath,
+  agentBusy,
+  agentLog,
+  onOpenPath,
+  onToggleDraft,
+  onDiscardDraft,
+  onCommitDrafts,
+  onRunAgent,
   reviewJob,
   jobLists,
   jobLoading,
@@ -2090,6 +2197,15 @@ function Workspace({
   applyError: string | null;
   hasGithubToken: boolean;
   onApplyFixes: (findingIds: string[]) => void;
+  drafts: DraftFile[];
+  openPath: string | null;
+  agentBusy: boolean;
+  agentLog: AgentLogItem[];
+  onOpenPath: (path: string) => void;
+  onToggleDraft: (path: string, accepted: boolean) => void;
+  onDiscardDraft: (path: string) => void;
+  onCommitDrafts: () => void;
+  onRunAgent: (instruction: string) => void;
   reviewJob: ReviewJob | null;
   jobLists: { pulls: JobListItem[]; branches: JobListItem[]; issues: JobListItem[] };
   jobLoading: boolean;
@@ -2287,7 +2403,7 @@ function Workspace({
             Overview
           </TabsTrigger>
           <TabsTrigger value="files" className="flex-1 sm:flex-none">
-            Files
+            Workspace{drafts.length ? ` (${drafts.length})` : ""}
           </TabsTrigger>
           <TabsTrigger value="review" className="flex-1 sm:flex-none">
             Review
@@ -2362,15 +2478,24 @@ function Workspace({
             ) : null}
           </div>
         </TabsContent>
-        <TabsContent value="files" className="h-[70vh] rounded-2xl bg-card p-4 shadow-[var(--shadow-border)]">
-          <FileList
-            files={bundle.files}
-            selected={selected}
+        <TabsContent value="files">
+          <CodeWorkspace
+            paths={bundle.files.map((file) => file.path)}
             contents={contents}
-            onToggle={onToggle}
-            onSmart={onSmart}
-            onSelectAll={onSelectAll}
-            listedTruncated={bundle.listedTruncated}
+            drafts={drafts}
+            openPath={openPath}
+            onOpenPath={onOpenPath}
+            agentBusy={agentBusy}
+            agentProgress={applyProgress}
+            agentLog={agentLog}
+            committing={applying}
+            hasToken={hasGithubToken}
+            draftError={applyError}
+            onToggleDraft={onToggleDraft}
+            onDiscardDraft={onDiscardDraft}
+            onCommitDrafts={onCommitDrafts}
+            onRunAgent={onRunAgent}
+            modelLabel={providerLabel || (resolvedTarget === "lmstudio" ? "LM Studio" : resolvedTarget === "grok" ? "Grok" : "no model")}
           />
         </TabsContent>
         <TabsContent value="review">
@@ -2382,7 +2507,7 @@ function Workspace({
             reviewing={reviewing}
             queueProgress={queueProgress}
             defaultBranch={meta.defaultBranch}
-            applying={applying}
+            applying={agentBusy}
             applyProgress={applyProgress}
             applyResult={applyResult}
             applyError={applyError}

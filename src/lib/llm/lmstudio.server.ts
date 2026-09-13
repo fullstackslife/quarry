@@ -96,6 +96,34 @@ export async function fetchLmStudioModels(
   }
 }
 
+async function ensureChatModelLoaded(openaiBase: string, model: string): Promise<string | null> {
+  const loaded = await fetchLoadedModelIds(openaiBase);
+  if (loaded.some((id) => id === model || id.endsWith(`/${model}`) || model.endsWith(`/${id}`))) {
+    return null;
+  }
+  const native = toNativeLmStudioUrl(openaiBase);
+  try {
+    const res = await fetch(`${native}/api/v1/models/load`, {
+      method: "POST",
+      headers: {
+        Authorization: lmStudioAuthHeader(),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model, context_length: 8192 }),
+      signal: AbortSignal.timeout(180_000),
+    });
+    if (res.ok) return null;
+    const text = await res.text();
+    return text.slice(0, 240) || `Could not load ${model} in LM Studio.`;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "";
+    if (message.toLowerCase().includes("abort")) {
+      return `Timed out loading ${model} in LM Studio.`;
+    }
+    return `Could not load ${model}: ${message || "unknown error"}`;
+  }
+}
+
 export async function fetchLmStudioChat(input: {
   requestedUrl?: string;
   model: string;
@@ -103,6 +131,10 @@ export async function fetchLmStudioChat(input: {
   temperature: number;
 }): Promise<Response> {
   const base = lmStudioBaseUrl(input.requestedUrl);
+  const loadError = await ensureChatModelLoaded(base, input.model);
+  if (loadError) {
+    return Response.json({ error: loadError }, { status: 503 });
+  }
   const upstream = await fetch(`${base}/chat/completions`, {
     method: "POST",
     headers: {

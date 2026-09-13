@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   DEFAULT_LM_STUDIO_URL,
   isAllowedLmStudioUrl,
+  isChatModelId,
   resolveLmStudioBaseUrl,
   toNativeLmStudioUrl,
   toOpenAiBaseUrl,
@@ -36,6 +37,12 @@ test("pickReviewModel uses loaded coder over a stale settings id", () => {
     pickReviewModel(["qwen/qwen3.5-9b"], ["qwen2.5-coder-7b-instruct"], ""),
     "qwen/qwen3.5-9b",
   );
+});
+
+test("isChatModelId skips ASR and embeddings", () => {
+  assert.equal(isChatModelId("qwen2.5-coder-7b-instruct"), true);
+  assert.equal(isChatModelId("nemotron-3.5-asr-streaming-0.6b"), false);
+  assert.equal(isChatModelId("text-embedding-nomic-embed-text-v1.5"), false);
 });
 
 test("allows loopback, LAN, and Tailscale, rejects public and file URLs", () => {
