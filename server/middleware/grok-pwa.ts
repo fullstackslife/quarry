@@ -25,6 +25,13 @@ import {
   renderWebManifest,
 } from "../../scripts/grok-pwa-shared.mjs";
 
+// Once per process — confirms the patched Node runtime in deploy logs.
+const bootGlobal = globalThis as typeof globalThis & { __nodeVersionLogged?: boolean };
+if (!bootGlobal.__nodeVersionLogged) {
+  bootGlobal.__nodeVersionLogged = true;
+  console.log(`[boot] Node ${process.version}`);
+}
+
 interface GrokPwaEvent {
   url: URL;
   req: { method: string; headers: Headers };

@@ -57,8 +57,8 @@ Code search needs a token that can search the repositories you care about (class
 | Command | What it does |
 |---|---|
 | `npm run dev` | Dev server on `0.0.0.0:8080` |
-| `npm run build` | Production build |
-| `npm run db:migrate` | Apply `migrations/` to `DATABASE_URL` |
+| `npm run build` | Production build (compile only; no DB access) |
+| `npm run db:migrate` | Apply `migrations/` to `DATABASE_URL` (Railway pre-deploy) |
 | `npm run db:push` | Upsert a `quarry-dump.json` into Railway Postgres |
 
 ## How a review works
